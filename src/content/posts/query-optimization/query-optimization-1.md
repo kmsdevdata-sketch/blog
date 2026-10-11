@@ -1,6 +1,6 @@
 ---
 title: "쿼리 최적화 1편: 대상 API 선정과 성능 베이스라인 측정"
-pubDatetime: 2026-10-12T12:00:00+09:00
+pubDatetime: 2026-10-12T00:00:00+09:00
 category: "DB"
 featured: false
 draft: false
@@ -193,4 +193,3 @@ export default function () {
 | 수신 데이터    | 71MB    | 213MB    | 353MB   |
 
 API 테스트에서는 별도로 추가 테스트를 할 이유는 없다고 판단된다.
-	

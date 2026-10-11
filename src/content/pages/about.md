@@ -2,7 +2,7 @@
 title: "About"
 description: "저에 대한 소개입니다."
 ---
-![프로필 이미지](/public/profile.png)
+![프로필 이미지](/profile.png)
 
 ## About This Blog
 
