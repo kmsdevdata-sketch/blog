@@ -7,28 +7,35 @@
   --color-muted: var(--muted);
   --color-muted-foreground: var(--muted-foreground);
   --color-border: var(--border);
+
   --font-app: var(--font-google-sans-code);
 }
 
-/* Light theme values */
+/* Light theme */
 :root,
 [data-theme="light"] {
-  --background: #fdfdfd;
-  --foreground: #282728;
-  --accent: #006cac;
-  --accent-foreground: #ffffff;
-  --muted: #e6e6e6;
-  --muted-foreground: #6b7280;
-  --border: #ece9e9;
+  --background: #ffffff;
+  --foreground: #0d0d0d;
+
+--accent: #4F46E5;
+--accent-foreground: #ffffff;
+
+  --muted: #f2f2f2;
+  --muted-foreground: #6b6b6b;
+
+  --border: #e5e5e5;
 }
 
-/* Dark theme values */
+/* Dark theme */
 [data-theme="dark"] {
-  --background: #212737;
-  --foreground: #eaedf3;
-  --accent: #ff6b01;
-  --accent-foreground: #ffffff;
-  --muted: #343f60;
-  --muted-foreground: #afb9ca;
-  --border: #ab4b08;
+  --background: #0d0d0d;
+  --foreground: #f7f7f8;
+
+--accent: #4F46E5;
+--accent-foreground: #ffffff;
+
+  --muted: #1f1f1f;
+  --muted-foreground: #a1a1a1;
+
+  --border: #2f2f2f;
 }

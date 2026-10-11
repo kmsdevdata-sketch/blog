@@ -1,0 +1,66 @@
+---
+import Layout from "@/layouts/Layout.astro";
+import Header from "@/components/Header.astro";
+import Footer from "@/components/Footer.astro";
+import config from "@/config";
+
+const categories = [
+  {
+    name: "Java",
+    slug: "java",
+    description: "Java 언어와 객체지향에 관한 기록",
+  },
+  {
+    name: "Spring",
+    slug: "spring",
+    description: "Spring과 백엔드 애플리케이션 개발",
+  },
+  {
+    name: "CS",
+    slug: "cs",
+    description: "운영체제, 네트워크, 컴퓨터 구조 등",
+  },
+  {
+    name: "DB",
+    slug: "db",
+    description: "데이터베이스와 데이터 처리",
+  },
+];
+---
+
+<Layout title={`Categories | ${config.site.title}`}>
+  <Header />
+
+  <main class="app-layout py-12">
+    <h1 class="text-3xl font-bold sm:text-4xl">
+      Categories
+    </h1>
+
+    <p class="text-muted-foreground mt-2">
+      주제별로 작성한 글을 모아봅니다.
+    </p>
+
+    <ul class="mt-8 grid gap-4 sm:grid-cols-2">
+      {
+        categories.map(category => (
+          <li>
+            <a
+              href={`/categories/${category.slug}`}
+              class="border-border hover:border-accent block rounded-xl border p-5 transition"
+            >
+              <h2 class="text-xl font-semibold">
+                {category.name}
+              </h2>
+
+              <p class="text-muted-foreground mt-1 text-sm">
+                {category.description}
+              </p>
+            </a>
+          </li>
+        ))
+      }
+    </ul>
+  </main>
+
+  <Footer />
+</Layout>
