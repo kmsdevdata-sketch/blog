@@ -169,11 +169,11 @@ The meaning of each item is as follows.
 |---|---|
 | Index Scan using uk_users_cognito_sub | Finds the user through the cognito_sub index |
 | rows=1 | Both the estimated and actual result contain one user |
-| actual time=0.055..0.057 | About 0.057ms from index lookup to result |
+| actual time=0.233..0.234 | About 0.234ms from index lookup to result |
 | loops=1 | This plan executed the SQL once |
 | Buffers: shared hit=3 | Three required database pages were already in memory cache |
-| Planning Time: 0.111 ms | Time spent planning the query |
-| Execution Time: 0.078 ms | Time spent executing this SQL once in the database |
+| Planning Time: 0.648 ms | Time spent planning the query |
+| Execution Time: 0.330 ms | Time spent executing this SQL once in the database |
 
 ### 2-1. Find the seller's store
 
@@ -244,12 +244,12 @@ The meaning of each item is as follows.
 
 | Query | Main plan characteristics | Database execution time |
 | ----------------------- | --------------------------------------- | -------- |
-| Seller lookup | One row via the cognito_sub index; three cached pages | 0.431ms |
-| Store by owner_user_id | Full table scan for one row; one cached page | 0.086ms |
-| Store by id | Full table scan for one row; one cached page | 0.166ms |
-| Unread-item count | Ten index candidates → five filtered by sender → five counted | 0.571ms |
+| Seller lookup | One row via the cognito_sub index; three cached pages | 0.330ms |
+| Store by owner_user_id | Full table scan for one row; one cached page | 0.217ms |
+| Store by id | Full table scan for one row; one cached page | 0.204ms |
+| Unread-item count | Ten index candidates → five filtered by sender → five counted | 0.858ms |
 
-The inquiry API response time I measured earlier was about `300ms`. Even if I cut the database execution time of queries 1 through 3 in half, that would not have much effect on the API response time, so I judged that improving the execution speed of those SQL statements was a low priority. (Of course, the duplicate calls need to be evaluated separately.)
+The inquiry API response time I measured earlier was about `400ms`. Even if I cut the database execution time of queries 1 through 3 in half, that would not have much effect on the API response time, so I judged that improving the execution speed of those SQL statements was a low priority. (Of course, the duplicate calls need to be evaluated separately.)
 However, query 4 is actually called 1,002 times, so I judged that I also needed to measure its cumulative cost.
 
 ### Measuring the cumulative cost of unread counts
