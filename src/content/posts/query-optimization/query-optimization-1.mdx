@@ -1,6 +1,6 @@
 ---
 title: "쿼리 최적화 1편: 대상 API 선정과 성능 베이스라인 측정"
-pubDatetime: 2026-10-12T00:00:00+09:00
+pubDatetime: 2026-10-11T23:00:00+09:00
 category: "DB"
 featured: false
 draft: false
@@ -13,9 +13,23 @@ tags:
 description: "기존 프로젝트의 조회 API를 분석하고 쿼리 최적화 전 성능 기준값을 측정한 과정을 정리합니다."
 ---
 
+import GitHubRepoCard from "@/components/GitHubRepoCard.astro";
+
 이번에 포트폴리오 강화 + 쿼리 분석 및 최적화 프로세스를 경험하기 위해 기존 프로젝트를 개선하기로 계획했다.  
-프로젝트는 이전에 진행했던 위하다 프로젝트(주문제작 케이크 매장의 상담·주문·결제를 한 흐름으로 관리하는 서비스)를 대상으로 선정했다.
-[위하다 프로젝트](https://github.com/kmsdevdata-sketch/wihada-api)
+프로젝트는 이전에 진행했던 위하다 프로젝트(주문제작 케이크 매장의 상담·주문·결제를 한 흐름으로 관리하는 서비스)를 대상으로 선정했다.  
+
+<GitHubRepoCard
+  repo="kmsdevdata-sketch/wihada-api"
+  title="위하다 API"
+  description="주문제작 케이크 매장의 상담·주문·결제 과정을 하나의 흐름으로 관리하는 백엔드 서비스"
+  previewImage="https://opengraph.githubassets.com/36f383c6d65701da09b0d3232d6d309021d2c7699d9e48818247aeaf6904a4a2/kmsdevdata-sketch/wihada-api"
+/>
+
+> [!info] 쿼리 최적화 시리즈
+>
+> **1편 · 대상 API 선정과 성능 베이스라인 측정**
+>
+> [2편 · SQL 및 실행 계획 분석 →](/posts/query-optimization/query-optimization-2/)
 
 > 해당 포스트에서 테스트 및 개선은 배포환경이 아닌 로컬 어플리케이션 기준으로 실시되었습니다!
 
@@ -193,3 +207,4 @@ export default function () {
 | 수신 데이터    | 71MB    | 213MB    | 353MB   |
 
 API 테스트에서는 별도로 추가 테스트를 할 이유는 없다고 판단된다.
+

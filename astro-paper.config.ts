@@ -2,14 +2,14 @@ import { defineAstroPaperConfig } from "./src/types/config";
 
 export default defineAstroPaperConfig({
   site: {
-    url: "https://astro-paper.pages.dev/",
+    url: "https://www.beingbe.tech/",
     title: "Being BE",
     description: "Backend Engineering Notes",
     author: "Minseo Kim",
-    profile: "https://satna.ing",
+    profile: "https://www.beingbe.tech/about/",
     ogImage: "default-og.jpg",
     lang: "en",
-    timezone: "Asia/Bangkok",
+    timezone: "Asia/Seoul",
     dir: "ltr",
   },
   posts: {
@@ -24,7 +24,7 @@ export default defineAstroPaperConfig({
     showBackButton: true,
     editPost: {
       enabled: true,
-      url: "https://github.com/satnaing/astro-paper/edit/main/",
+      url: "https://github.com/kmsdevdata-sketch/blog/edit/main/",
     },
     search: "pagefind",
   },

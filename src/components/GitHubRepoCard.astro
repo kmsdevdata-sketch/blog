@@ -1,0 +1,72 @@
+---
+import IconGithub from "@/assets/icons/socials/github.svg";
+
+type Props = {
+  repo: string;
+  title?: string;
+  description?: string;
+  href?: string;
+  previewImage?: string;
+};
+
+const {
+  repo,
+  title = repo.split("/").at(-1) ?? repo,
+  description,
+  href = `https://github.com/${repo}`,
+  previewImage,
+} = Astro.props;
+---
+
+<a
+  href={href}
+  target="_blank"
+  rel="noreferrer"
+  aria-label={`${title} GitHub 저장소 열기`}
+  class="not-prose group border-border bg-muted/30 hover:border-accent focus-visible:border-accent my-6 flex min-h-40 flex-col-reverse overflow-hidden rounded-xl border no-underline shadow-sm transition duration-200 hover:-translate-y-0.5 hover:shadow-md sm:flex-row"
+>
+  <div class="min-w-0 flex-1 p-4 sm:p-5">
+    <div
+      class="text-muted-foreground flex items-center gap-2 text-xs font-medium"
+    >
+      <IconGithub class="size-4" aria-hidden="true" />
+      <span>GitHub Repository</span>
+    </div>
+
+    <div class="text-foreground mt-2 text-lg font-semibold">{title}</div>
+    <div class="text-muted-foreground mt-1 font-mono text-sm">{repo}</div>
+
+    {
+      description && (
+        <p class="text-muted-foreground mt-3 mb-0 text-sm leading-6">
+          {description}
+        </p>
+      )
+    }
+
+    <div class="text-accent mt-4 flex items-center gap-1 text-sm font-medium">
+      <span>GitHub에서 보기</span>
+      <span
+        aria-hidden="true"
+        class="transition-transform group-hover:translate-x-1"
+      >
+        →
+      </span>
+    </div>
+  </div>
+
+  {
+    previewImage && (
+      <div class="bg-muted border-border aspect-[2/1] shrink-0 overflow-hidden border-b sm:aspect-auto sm:w-52 sm:border-b-0 sm:border-l">
+        <img
+          src={previewImage}
+          alt={`${title} GitHub 저장소 미리보기`}
+          loading="lazy"
+          decoding="async"
+          onerror="this.parentElement.remove()"
+          class="size-full object-cover transition duration-300 group-hover:scale-[1.025]"
+        />
+      </div>
+    )
+  }
+</a>
