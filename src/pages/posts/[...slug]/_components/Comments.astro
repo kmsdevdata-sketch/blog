@@ -1,0 +1,42 @@
+---
+import config from "@/config";
+
+type Props = { discussionKey: string };
+
+const { discussionKey } = Astro.props;
+const locale = Astro.currentLocale === "en" ? "en" : "ko";
+const giscus = config.giscus;
+---
+
+{
+  giscus?.categoryId && (
+    <section
+      aria-labelledby="comments-heading"
+      class="border-border mt-12 border-t border-dashed pt-8"
+      data-pagefind-ignore
+    >
+      <h2 id="comments-heading" class="text-xl font-bold sm:text-2xl">
+        {locale === "ko" ? "댓글" : "Comments"}
+      </h2>
+      <p class="text-muted-foreground mt-2 mb-6 text-sm">
+        {locale === "ko"
+          ? "GitHub 계정으로 의견을 남기거나 글에 반응할 수 있습니다."
+          : "Use your GitHub account to comment or react."}
+      </p>
+      <div
+        id="giscus-comments"
+        class="giscus min-h-32"
+        data-repo={giscus.repo}
+        data-repo-id={giscus.repoId}
+        data-category={giscus.category}
+        data-category-id={giscus.categoryId}
+        data-term={discussionKey}
+        data-lang={locale}
+      />
+    </section>
+  )
+}
+
+<script>
+  import "@/scripts/giscus";
+</script>

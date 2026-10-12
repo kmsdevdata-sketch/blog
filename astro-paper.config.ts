@@ -34,6 +34,12 @@ export default defineAstroPaperConfig({
     { name: "linkedin", url: "https://www.linkedin.com/in/%EB%AF%BC%EC%84%9C-%EA%B9%80-79823a416/" },
     { name: "mail",     url: "mailto:kms.dev.data@gmail.com" },
   ],
+  giscus: {
+    repo: "kmsdevdata-sketch/blog",
+    repoId: "R_kgDOVE-8Sg",
+    category: "Announcements",
+    categoryId: "DIC_kwDOVE-8Ss4DIG7j",
+  },
   // shareLinks: [
   //   { name: "whatsapp", url: "https://wa.me/?text=" },
   //   { name: "facebook", url: "https://www.facebook.com/sharer.php?u=" },

@@ -36,6 +36,7 @@ const config: ResolvedAstroPaperConfig = {
   },
   socials: userConfig.socials ?? [],
   shareLinks: userConfig.shareLinks ?? [],
+  giscus: userConfig.giscus,
 };
 
 export default config;
