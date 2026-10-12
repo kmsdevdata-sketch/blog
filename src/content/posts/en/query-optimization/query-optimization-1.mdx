@@ -1,0 +1,211 @@
+---
+title: "Query Optimization, Part 1: Choosing APIs and Measuring a Performance Baseline"
+lang: en
+translationKey: query-optimization-1
+pubDatetime: 2026-10-11T23:00:00+09:00
+category: "DB"
+featured: false
+draft: false
+tags:
+  - Query Optimization
+  - PostgreSQL
+  - Spring Boot
+  - k6
+  - Performance Test
+description: "This post describes how I analyzed the read APIs of an existing project and measured their performance baseline before query optimization."
+---
+
+import GitHubRepoCard from "@/components/GitHubRepoCard.astro";
+
+This time, I planned to improve an existing project to strengthen my portfolio and experience the process of query analysis and optimization.\
+I chose Wihada, a project I had worked on before (a service that manages consultation, ordering, and payment for custom cake shops in one workflow).\
+
+<GitHubRepoCard
+  repo="kmsdevdata-sketch/wihada-api"
+  title="Wihada API"
+  description="A backend service that manages consultation, ordering, and payment for custom cake shops in one workflow"
+  previewImage="https://opengraph.githubassets.com/36f383c6d65701da09b0d3232d6d309021d2c7699d9e48818247aeaf6904a4a2/kmsdevdata-sketch/wihada-api"
+/>
+
+> [!info] Query optimization series
+>
+> **Part 1 · Choosing APIs and measuring a performance baseline**
+>
+> [Part 2 · Analyzing SQL and execution plans →](/en/posts/query-optimization/query-optimization-2/)
+
+> The testing and improvements in this post were carried out against the local application, not the deployed environment!
+
+## Choosing the APIs to analyze
+First, I needed to select the APIs to test and improve, so I looked for candidates using the criteria below.
+- Identify the main APIs that read from the database.
+- → Classify candidates by read frequency, query complexity, and the possibility of data growth.
+- → Select two or three target APIs from those candidates.
+Wihada handles buyer, seller, and administrator APIs in the same application. For the initial classification, I focused on the seller APIs because I thought they would manage relatively more data.
+
+I used Codex to identify and classify the APIs, and the list below was the result.
+
+| Area | APIs |
+|---|---|
+| Dashboard aggregates | `GET /seller/dashboard`, `GET /seller/dashboard/revenue`, `GET /seller/dashboard/revenue/transactions` |
+| Order list and calendar | `GET /seller/orders`, `GET /seller/orders/calendar/today`, `GET /seller/orders/calendar/week`, `GET /seller/orders/calendar/month` |
+| Inquiry and chat lists | `GET /seller/inquiries`, `GET /seller/inquiries/{inquiryId}/events` |
+| Inquiry history | `GET /seller/inquiries/{inquiryId}/order-form-submissions`, `GET /seller/inquiries/{inquiryId}/confirmations` |
+| Overall store status | `GET /seller/store/management-status` |
+| Various settings and notice management | `GET /seller/store/settings`, `PUT /seller/store/settings`, `GET /seller/notices`, `PUT /seller/notices` |
+| Image and gallery lists | `GET /seller/gallery-items`, `GET /seller/representative-images` |
+
+At this point, I excluded single-item APIs and first narrowed the list to items, such as list and aggregate APIs, whose query costs could rise as the number of records retrieved increased.
+
+As for read frequency, there was no real user data, so I could only guess. I therefore removed it from the selection criteria and chose items based on code whose cost would grow with the data and where repeated reads occurred.
+
+1. `GET /seller/inquiries`: loads all inquiries for a store and separately queries the number of unread items for each inquiry.
+2. `GET /seller/dashboard`: queries several aggregates and the number of unread items for each inquiry.
+3. `GET /seller/orders`: loads the entire accumulated order list.
+
+## Setting up a local test environment
+### Test environment
+For the local test environment, I ran the Spring Boot application locally with the `local-scenario` profile and configured it to connect to PostgreSQL at `localhost:5432`.
+The application originally used Cognito for authentication, but I used a local test token for the local tests, and the local file system instead of S3 for storing assets.
+
+### Preparing test data
+
+| Stage | Inquiries per store | Events per inquiry | Orders per store |
+| ------ | --------- | ------- | --------- |
+| Data volume | 1,000 | 10 | 1,000 |
+
+
+![Test data insertion result](../../query-optimization/assets/test-data-result.png)
+Buyers: 1,000\
+Chat rooms: 1,000\
+Chat messages: 10,000\
+Chat timeline events (e.g., issuing order forms, requesting payments, etc.): 10,000\
+Orders: 1,000
+
+## Measuring the baseline
+### Test tool
+I used k6 as the test tool. The biggest reason I chose k6 was that I had used it before, and I came to use it often because the process from installation to writing the code and running it was simpler than with other tools.
+
+### Test scenario
+#### Goal
+The goal of this test was to get baseline values for how long each API takes with the current data and how that changes as the number of requests increases, rather than to find out "the maximum number of users who can connect" or "how much load it can withstand." (I would optimize the queries, measure again, and compare the results.)
+#### Request rate
+| Stage | Request rate | Duration | Purpose |
+| --- | ------ | ------ | ------------ |
+| Warm-up | Low | 30–60 seconds | Reduce first-run effects |
+| Stage 1 | 1 request/second | 2 minutes | Baseline response time |
+| Stage 2 | 3 requests/second | 2 minutes | Effect of increased traffic |
+| Stage 3 | 5 requests/second | 2 minutes | Effect of another increase |
+> Reason for warming up: the first few requests can be affected by the JVM's running state, database connection preparation, and disk caching, so warming up lets me distinguish those effects when measuring.
+#### Expected results and metrics
+| Metric | What I wanted to check |
+| -------------------------------- | ---------------------------- |
+| SQL executions per request | Does an inquiry or dashboard request repeat a query for every inquiry? |
+| Execution time per SQL and total database time | Which queries consume the most time? |
+| API response time, p50 and p95 | How much does database work affect the actual response time? |
+| Returned item count and response size | Am I comparing responses with the same amount of data? |
+| Error rate | Do requests fail as the system slows down? |
+| Actual request count and dropped_iterations | Did the planned traffic actually reach the application? |
+### Test code
+```javascript
+import http from 'k6/http';
+import { check } from 'k6';
+
+// APIs under test
+const paths = {
+    inquiries: '/seller/inquiries',
+    dashboard: '/seller/dashboard',
+    orders: '/seller/orders',
+};
+
+// Values supplied at runtime
+const target = __ENV.TARGET;
+const rate = Number(__ENV.RATE);
+const minItems = Number(__ENV.MIN_ITEMS || 1000);
+const baseUrl = __ENV.BASE_URL || 'http://localhost:8080';
+const token = __ENV.SELLER_TOKEN || 'local-seller-token';
+
+export const options = {
+    scenarios: {
+        seller_query: {
+            executor: 'constant-arrival-rate',
+            rate,
+            timeUnit: '1s',
+            duration: __ENV.DURATION || '2m',
+            preAllocatedVUs: 20,
+            maxVUs: 100,
+        },
+    },
+    thresholds: {
+        checks: ['rate==1'],
+    },
+};
+
+export default function () {
+    const response = http.get(`${baseUrl}${paths[target]}`, {
+        headers: {
+            Authorization: `Bearer ${token}`,
+        },
+    });
+
+    let body = null;
+    if (response.status === 200) {
+        try {
+            body = response.json();
+        } catch (_) {
+            // A non-JSON response fails the validation below
+        }
+    }
+
+    const validData =
+        body !== null &&
+        body.success === true &&
+        (target === 'dashboard'
+            ? body.data !== null &&
+            typeof body.data === 'object' &&
+            !Array.isArray(body.data)
+            : Array.isArray(body.data) && body.data.length >= minItems);
+
+    check(response, {
+        'HTTP 200': (r) => r.status === 200,
+        'expected response data': () => validData,
+    });
+}
+```
+
+### Results
+#### Chat room lookup summary
+| Metric | 1 request/second | 3 requests/second | 5 requests/second |
+| --------- | -------- | -------- | -------- |
+| Actual requests | 120 | 361 | 601 |
+| Mean response time | 302.90ms | 255.51ms | 267.35ms |
+| p50 response time | 299.22ms | 241.77ms | 244.66ms |
+| p95 response time | 336.84ms | 328.44ms | 384.94ms |
+| Maximum response time | 527.22ms | 491.86ms | 1.04s |
+| HTTP failures | 0 | 0 | 0 |
+| Response checks | All passed | All passed | All passed |
+| Data received | 93MB | 280MB | 467MB |
+#### Dashboard summary
+
+| Metric | 1 request/second | 3 requests/second | 5 requests/second |
+|---|---|---|---|
+| Actual requests | 120 | 361 | 601 |
+| Mean response time | 275.00ms | 226.00ms | 223.36ms |
+| p50 response time | 269.80ms | 218.27ms | 212.23ms |
+| p95 response time | 322.66ms | 271.25ms | 289.64ms |
+| Maximum response time | 379.30ms | 572.89ms | 588.90ms |
+| HTTP failures | 0 | 0 | 0 |
+| Response checks | All passed | All passed | All passed |
+| Data received | 1.4MB | 4.3MB | 7.1MB |
+#### Order list summary
+| Metric | 1 request/second | 3 requests/second | 5 requests/second |
+| --------- | ------- | -------- | ------- |
+| Actual requests | 121 | 361 | 600 |
+| Mean response time | 37.04ms | 31.52ms | 31.79ms |
+| p50 response time | 37.90ms | 31.31ms | 32.38ms |
+| p95 response time | 45.19ms | 41.84ms | 41.41ms |
+| Maximum response time | 51.07ms | 117.52ms | 78.19ms |
+| HTTP failures | 0 | 0 | 0 |
+| Response checks | All passed | All passed | All passed |
+| Data received | 71MB | 213MB | 353MB |
+
+I decided there was no reason to run additional tests for these API tests.

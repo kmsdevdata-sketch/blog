@@ -1,5 +1,4 @@
 ---
-import { getCollection } from "astro:content";
 import { getRelativeLocaleUrl } from "astro:i18n";
 import IconRss from "@/assets/icons/IconRss.svg";
 import IconArrowRight from "@/assets/icons/IconArrowRight.svg";
@@ -9,7 +8,7 @@ import Footer from "@/components/Footer.astro";
 import Socials from "@/components/Socials.astro";
 import Card from "@/components/Card.astro";
 import LinkButton from "@/components/LinkButton.astro";
-import { getSortedPosts } from "@/utils/getSortedPosts";
+import { getLocalizedPosts, type BlogLocale } from "@/utils/getLocalizedPosts";
 import { useTranslations } from "@/i18n";
 import config from "@/config";
 
@@ -18,8 +17,7 @@ const { socials, posts: postsConfig } = config;
 const locale = Astro.currentLocale ?? config.site.lang;
 const t = useTranslations(locale);
 
-const posts = await getCollection("posts");
-const sortedPosts = getSortedPosts(posts);
+const sortedPosts = await getLocalizedPosts(locale as BlogLocale);
 const featuredPosts = sortedPosts.filter(({ data }) => data.featured);
 const recentPosts = sortedPosts.filter(({ data }) => !data.featured);
 const homePath = getRelativeLocaleUrl(locale, "");
@@ -33,61 +31,62 @@ const homePath = getRelativeLocaleUrl(locale, "");
     data-home-path={homePath}
     class="app-layout my-1"
   >
-  <section id="hero" class="border-border border-b pt-8 pb-6">
-  <div class="my-4 flex items-center gap-5 sm:my-8">
-    <img
-      src="/profile.png"
-      alt="Minseo Kim"
-      class="h-20 w-20 rounded-full object-cover sm:h-24 sm:w-24"
-    />
+    <section id="hero" class="border-border border-b pt-8 pb-6">
+      <div class="my-4 flex items-center gap-5 sm:my-8">
+        <img
+          src="/profile.png"
+          alt="Minseo Kim"
+          class="h-20 w-20 rounded-full object-cover sm:h-24 sm:w-24"
+        />
 
-    <div>
-      <div class="flex items-center gap-3">
-        <h1 class="text-4xl font-bold sm:text-5xl">
-          Minseo Kim
-        </h1>
+        <div>
+          <div class="flex items-center gap-3">
+            <h1 class="text-4xl font-bold sm:text-5xl">Minseo Kim</h1>
 
-        <a
-          target="_blank"
-          href={`${import.meta.env.BASE_URL.replace(/\/?$/, "/")}rss.xml`}
-          class="inline-block"
-          aria-label="RSS Feed"
-          title="RSS Feed"
-        >
-          <IconRss
-            width={20}
-            height={20}
-            class="stroke-accent scale-125 stroke-3 rtl:-rotate-90"
-          />
-          <span class="sr-only">RSS Feed</span>
-        </a>
+            <a
+              target="_blank"
+              href={getRelativeLocaleUrl(locale, "rss.xml").replace(/\/+$/, "")}
+              class="inline-block"
+              aria-label="RSS Feed"
+              title="RSS Feed"
+            >
+              <IconRss
+                width={20}
+                height={20}
+                class="stroke-accent scale-125 stroke-3 rtl:-rotate-90"
+              />
+              <span class="sr-only">RSS Feed</span>
+            </a>
+          </div>
+
+          <p class="text-muted-foreground mt-2">Backend Developer</p>
+        </div>
       </div>
+
+      <p class="text-lg">
+        Backend engineering notes on Java, Spring, databases, and software
+        design.
+      </p>
 
       <p class="text-muted-foreground mt-2">
-        Backend Developer
+        {
+          locale === "en"
+            ? "Learning by writing, understanding by building"
+            : "기록하면서 배우고 구현하면서 이해하기"
+        }
       </p>
-    </div>
-  </div>
 
-  <p class="text-lg">
-    Backend engineering notes on Java, Spring, databases, and software design.
-  </p>
-
-  <p class="text-muted-foreground mt-2">
-    기록하면서 배우고 구현하면서 이해하기
-  </p>
-
-  {
-    socials.length > 0 && (
-      <div class="mt-4 flex max-sm:flex-col sm:items-center">
-        <div class="me-2 mb-1 whitespace-nowrap sm:mb-0">
-          {t.home.socialLinks}:
-        </div>
-        <Socials />
-      </div>
-    )
-  }
-</section>
+      {
+        socials.length > 0 && (
+          <div class="mt-4 flex max-sm:flex-col sm:items-center">
+            <div class="me-2 mb-1 whitespace-nowrap sm:mb-0">
+              {t.home.socialLinks}:
+            </div>
+            <Socials />
+          </div>
+        )
+      }
+    </section>
 
     {
       featuredPosts.length > 0 && (

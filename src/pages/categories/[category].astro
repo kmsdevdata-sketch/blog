@@ -9,6 +9,8 @@ import Card from "@/components/Card.astro";
 import { getSortedPosts } from "@/utils/getSortedPosts";
 import config from "@/config";
 
+type Props = Record<string, never>;
+
 export function getStaticPaths() {
   return ["java", "spring", "cs", "db"].map(category => ({
     params: { category },
@@ -30,10 +32,12 @@ const posts = await getCollection(
   "posts",
   ({ data }) =>
     !data.draft &&
-    data.category === categoryName
+    data.category === categoryName &&
+    data.lang === (Astro.currentLocale ?? config.site.lang)
 );
 
 const sortedPosts = getSortedPosts(posts);
+const isEnglish = Astro.currentLocale === "en";
 ---
 
 <Layout title={`${categoryName} | ${config.site.title}`}>
@@ -45,7 +49,7 @@ const sortedPosts = getSortedPosts(posts);
     </h1>
 
     <p class="text-muted-foreground mt-2">
-      {categoryName} 카테고리의 글
+      {isEnglish ? `Posts in ${categoryName}` : `${categoryName} 카테고리의 글`}
     </p>
 
     {
@@ -57,7 +61,7 @@ const sortedPosts = getSortedPosts(posts);
         </ul>
       ) : (
         <p class="text-muted-foreground mt-10">
-          아직 작성된 글이 없습니다.
+          {isEnglish ? "No posts yet." : "아직 작성된 글이 없습니다."}
         </p>
       )
     }

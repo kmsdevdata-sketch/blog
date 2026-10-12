@@ -13,6 +13,8 @@ import { useTranslations } from "@/i18n";
 import config from "@/config";
 
 const { site, features } = config;
+type Props = { languageSwitchHref?: string };
+const { languageSwitchHref } = Astro.props;
 
 const locale = Astro.currentLocale ?? config.site.lang;
 const t = useTranslations(locale);
@@ -26,6 +28,14 @@ const pathWithoutTrailingSlash =
     : relativePath;
 
 const currentPath = stripLocale(pathWithoutTrailingSlash, locale);
+const otherLocale = locale === "ko" ? "en" : "ko";
+const switchPath = /^\/posts\//.test(currentPath)
+  ? "posts"
+  : /^\/tags\//.test(currentPath)
+    ? "tags"
+    : currentPath.replace(/^\//, "");
+const otherHref =
+  languageSwitchHref ?? getRelativeLocaleUrl(otherLocale, switchPath);
 
 const isActive = (path: string) => {
   const currentPathArray = currentPath.split("/").filter(p => p.trim());
@@ -151,6 +161,51 @@ const isActive = (path: string) => {
             </li>
           )
         }
+        <li class="col-span-2 flex items-center justify-center sm:col-span-1">
+          <nav
+            aria-label="Language"
+            class="border-border bg-muted/40 flex items-center rounded-full border p-0.5 text-xs font-semibold tracking-wide"
+          >
+            {
+              locale === "ko" ? (
+                <span
+                  aria-current="page"
+                  class="bg-accent text-accent-foreground rounded-full px-2 py-1"
+                >
+                  KO
+                </span>
+              ) : (
+                <a
+                  href={otherHref}
+                  lang="ko"
+                  data-astro-reload
+                  class="hover:text-accent rounded-full px-2 py-1"
+                >
+                  KO
+                </a>
+              )
+            }
+            {
+              locale === "en" ? (
+                <span
+                  aria-current="page"
+                  class="bg-accent text-accent-foreground rounded-full px-2 py-1"
+                >
+                  EN
+                </span>
+              ) : (
+                <a
+                  href={otherHref}
+                  lang="en"
+                  data-astro-reload
+                  class="hover:text-accent rounded-full px-2 py-1"
+                >
+                  EN
+                </a>
+              )
+            }
+          </nav>
+        </li>
         {
           features.lightAndDarkMode && (
             <li class="col-span-1 flex items-center justify-center">

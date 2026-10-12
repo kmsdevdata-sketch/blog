@@ -3,7 +3,7 @@ import { Font } from "astro:assets";
 import { ClientRouter } from "astro:transitions";
 import { getRelativeLocaleUrl } from "astro:i18n";
 import { resolveDefaultOgImagePath } from "@/utils/resolveDefaultOgImagePath";
-import { getAssetPath } from "@/utils/withBase";
+import { getAssetPath, stripBase, stripLocale } from "@/utils/withBase";
 import config from "@/config";
 import "@/styles/global.css";
 
@@ -12,6 +12,8 @@ type Props = {
   description?: string;
   ogImage?: string;
   canonicalURL?: string;
+  alternateUrls?: { ko: string; en: string };
+  noindex?: boolean;
 };
 
 const { site } = config;
@@ -21,13 +23,27 @@ const {
   description = site.description,
   ogImage = resolveDefaultOgImagePath(config),
   canonicalURL = new URL(Astro.url.pathname, Astro.site).href,
+  alternateUrls,
+  noindex = false,
 } = Astro.props;
 
+const locale = Astro.currentLocale ?? site.lang;
+const logicalPath = stripLocale(stripBase(Astro.url.pathname), locale);
+const hasStaticTranslation =
+  /^\/(?:about|archives|categories(?:\/(?:java|spring|cs|db))?|posts|search|tags)?\/?$/.test(
+    logicalPath
+  );
+const alternates =
+  alternateUrls ??
+  (hasStaticTranslation
+    ? {
+        ko: new URL(getRelativeLocaleUrl("ko", logicalPath), Astro.site).href,
+        en: new URL(getRelativeLocaleUrl("en", logicalPath), Astro.site).href,
+      }
+    : undefined);
+
 const socialImageURL = new URL(ogImage, Astro.site ?? Astro.url);
-const rssHref = getRelativeLocaleUrl(
-  Astro.currentLocale ?? config.site.lang,
-  "rss.xml"
-);
+const rssHref = getRelativeLocaleUrl(locale, "rss.xml").replace(/\/+$/, "");
 ---
 
 <!doctype html>
@@ -48,6 +64,9 @@ const rssHref = getRelativeLocaleUrl(
     <link rel="apple-touch-icon" href={getAssetPath("apple-touch-icon.png")} />
     <link rel="manifest" href={getAssetPath("site.webmanifest")} />
     <link rel="canonical" href={canonicalURL} />
+    {noindex && <meta name="robots" content="noindex,follow" />}
+    {alternates && <link rel="alternate" hreflang="ko" href={alternates.ko} />}
+    {alternates && <link rel="alternate" hreflang="en" href={alternates.en} />}
     <meta name="generator" content={Astro.generator} />
 
     <!-- Font -->

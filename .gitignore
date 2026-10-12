@@ -29,5 +29,9 @@ public/pagefind
 # pnpm
 .pnpm-store
 
+# local agent and translation instructions
+/AGENTS.md
+/docs/bilingual-content.md
+
 # docker compose
 compose.override.yaml

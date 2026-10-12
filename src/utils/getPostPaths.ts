@@ -9,6 +9,7 @@ function getPostPathSegments(filePath: string | undefined): string[] {
       ?.replace(BLOG_PATH, "")
       .split("/")
       .filter(path => path !== "")
+      .filter((path, index) => !(index === 0 && path === "en"))
       .filter(path => !path.startsWith("_"))
       .slice(0, -1)
       .map(segment => slugifyStr(segment)) ?? []

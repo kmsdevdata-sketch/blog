@@ -16,13 +16,16 @@ const {
   href = `https://github.com/${repo}`,
   previewImage,
 } = Astro.props;
+const isEnglish = Astro.currentLocale === "en";
 ---
 
 <a
   href={href}
   target="_blank"
   rel="noreferrer"
-  aria-label={`${title} GitHub 저장소 열기`}
+  aria-label={isEnglish
+    ? `Open ${title} on GitHub`
+    : `${title} GitHub 저장소 열기`}
   class="not-prose group border-border bg-muted/30 hover:border-accent focus-visible:border-accent my-6 flex min-h-40 flex-col-reverse overflow-hidden rounded-xl border no-underline shadow-sm transition duration-200 hover:-translate-y-0.5 hover:shadow-md sm:flex-row"
 >
   <div class="min-w-0 flex-1 p-4 sm:p-5">
@@ -45,7 +48,7 @@ const {
     }
 
     <div class="text-accent mt-4 flex items-center gap-1 text-sm font-medium">
-      <span>GitHub에서 보기</span>
+      <span>{isEnglish ? "View on GitHub" : "GitHub에서 보기"}</span>
       <span
         aria-hidden="true"
         class="transition-transform group-hover:translate-x-1"
@@ -60,7 +63,11 @@ const {
       <div class="bg-muted border-border aspect-[2/1] shrink-0 overflow-hidden border-b sm:aspect-auto sm:w-52 sm:border-b-0 sm:border-l">
         <img
           src={previewImage}
-          alt={`${title} GitHub 저장소 미리보기`}
+          alt={
+            isEnglish
+              ? `${title} GitHub repository preview`
+              : `${title} GitHub 저장소 미리보기`
+          }
           loading="lazy"
           decoding="async"
           onerror="this.parentElement.remove()"

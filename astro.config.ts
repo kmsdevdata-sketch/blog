@@ -25,12 +25,15 @@ export default defineConfig({
     mdx(),
     sitemap({
       filter: page =>
-        config.features?.showArchives !== false || !page.endsWith("/archives/"),
+        !page.endsWith("/search/") &&
+        !page.endsWith("/404/") &&
+        (config.features?.showArchives !== false ||
+          !page.endsWith("/archives/")),
     }),
   ],
   i18n: {
-    locales: ["en"],
-    defaultLocale: "en",
+    locales: ["ko", "en"],
+    defaultLocale: "ko",
     routing: {
       prefixDefaultLocale: false,
     },

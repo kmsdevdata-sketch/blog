@@ -16,6 +16,8 @@ const posts = defineCollection({
       modDatetime: z.date().optional().nullable(),
 
       title: z.string(),
+      lang: z.enum(["ko", "en"]).default("ko"),
+      translationKey: z.string().optional(),
 
       category: z.enum(["Java", "Spring", "CS", "DB"]),
 

@@ -8,7 +8,7 @@ export default defineAstroPaperConfig({
     author: "Minseo Kim",
     profile: "https://www.beingbe.tech/about/",
     ogImage: "default-og.jpg",
-    lang: "en",
+    lang: "ko",
     timezone: "Asia/Seoul",
     dir: "ltr",
   },
