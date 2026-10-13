@@ -1,0 +1,298 @@
+---
+title: "Query Optimization, Part 3: Analyzing Application Code and Improving Performance"
+lang: en
+translationKey: query-optimization-3
+pubDatetime: 2026-10-14T01:00:00+09:00
+category: "DB"
+featured: false
+draft: false
+tags:
+  - Query Optimization
+  - PostgreSQL
+  - Spring Boot
+  - Performance Test
+  - N+1
+description: "I trace repeated queries through the application code, change unread-item counts to be aggregated in one batch, and measure HTTP response times and SQL execution costs again."
+---
+
+import GitHubRepoCard from "@/components/GitHubRepoCard.astro";
+
+This is part 3 of my plan to improve an existing project to strengthen my portfolio and experience the process of query analysis and optimization.
+[Wihada project](https://github.com/kmsdevdata-sketch/wihada-api)
+
+<GitHubRepoCard
+  repo="kmsdevdata-sketch/wihada-api"
+  title="Wihada API"
+  description="A backend service that manages consultation, ordering, and payment for custom cake shops in one workflow"
+  previewImage="https://opengraph.githubassets.com/36f383c6d65701da09b0d3232d6d309021d2c7699d9e48818247aeaf6904a4a2/kmsdevdata-sketch/wihada-api"
+/>
+
+> [!info] Query optimization series
+>
+> [Part 1 · Choosing APIs and measuring a performance baseline →](/en/posts/query-optimization/query-optimization-1/)
+>
+> [Part 2 · Analyzing SQL and execution plans →](/en/posts/query-optimization/query-optimization-2/)
+>
+> **Part 3 · Analyzing application code and improving performance**
+
+> The testing and improvements in this post were carried out against the local application, not the deployed environment!
+
+In the previous post, I analyzed SQL and execution plans.
+After that analysis, I felt that analyzing and improving the application itself was more necessary than improving the SQL or execution plans. So let's proceed through analyzing the application code -> designing an improvement -> implementing it -> verifying it again.
+
+## Analyzing the application code
+### Controller
+The actual implementation of `GET /seller/inquiries`, which I selected for improvement after the analysis in the previous post, looks like this when I start with the controller.
+```java
+ @GetMapping("/seller/inquiries")
+  public ApiResponse<List<InquiryListItemResponse>> getSellerInquiries(
+      @CurrentStoreId UUID storeId,
+      @Authenticated CurrentUser currentUser,
+      @RequestParam(required = false) InquiryStatus status,
+      @RequestParam(defaultValue = "false") boolean unreadOnly) {
+    return ApiResponse.ok(
+        inquiryListUseCase
+            .getSellerInquiries(storeId, currentUser.userId(), status, unreadOnly)
+            .stream()
+            .map(InquiryListItemResponse::from)
+            .toList());
+  }
+```
+`@CurrentStoreID` is an annotation I implemented myself. `StoreContextFilter` looks up the authenticated user in the DB, finds that seller's store ID, and puts it in `StoreContext`. An argument resolver then takes that value and passes it to the controller parameter.
+
+`@Authenticated` looks up the user again through the `currentUserRender` component and passes a `CurrentUser` object containing the current user's information to the controller parameter.
+#### Problem 1: Looking up the same seller three times
+Here I found the first of the three problems identified in the previous post: `looking up the same seller three times`.
+
+The `StoreContextFilter` and `@Authenticated` described above each look up the current user, making two lookups. After checking a little further, I found another lookup in `SellerOnboardingApprovalFilter`, which checks whether the current requesting user's (seller's) store has onboarding approval. In the end, the same seller is looked up three times in one request.
+
+I considered ways to improve this, but decided to defer changing this part of the code for now.
+1. I could change the use case implementation to take a user ID and look up the store. But if other implementations need the same handling, duplicate code could increase, so I judged that this was not enough reason to change the current structure.
+2. I also thought about splitting `CurentUser` into separate Seller, Buyer, and Operator objects according to role. I thought it was worth considering from a design standpoint, but this alone would not resolve all three user lookups, and the scope of the change would be large, so I did not want to pursue it in this work.
+3. It is true that duplicate lookups occur in the structure that checks the current user, but I judged that each step's role is necessary in itself.
+Above all, one execution of the earlier seller-lookup SQL took about **0.330ms** in the DB. So although I confirmed that duplicate lookups exist, given the current measurements, I did not see them as a performance problem that needed to be improved first.
+Therefore, I decided to record this problem and analyze the next one.
+
+### Execution logic
+Looking at the actual use case implementation, it is written as follows.
+```java
+@Override  
+@Transactional(readOnly = true)  
+public List<InquiryListItem> getSellerInquiries(  
+    UUID storeId, UUID sellerUserId, InquiryStatus status, boolean unreadOnly) { 
+    
+    // Filter by status and whether the inquiry is visible to the seller
+	List<Inquiry> inquiries =    inquiryPersistencePort.findAllByStoreId(storeId).stream()  
+      .filter(inquiry -> isSellerListTarget(inquiry, status))  
+      .toList();  
+      
+	// Find the store object that matches the request parameter
+	Store store = inquiries.isEmpty() ? null : findStore(storeId);  
+	
+	// Create a Map containing each buyer's ID and that buyer's User object
+	Map<UUID, User> buyersById = buyersById(inquiries);  
+  
+	// Create a Map containing each buyer's ID and profile DeliveryUrl
+	Map<UUID, String> profileImageDeliveryUrlByUserId =  profileImageDeliveryService.resolveByUserId(buyersById.values().stream().toList());  
+	// Create a Map containing each chat room's ID and latest event (message, CTA, etc.)
+	  Map<UUID, InquiryListItem.LatestEvent> latestEventByInquiryId =  
+      latestEventByInquiryId(inquiries);  
+      
+	// Create a Map containing each chat room's ID and latest order form (needed to identify the chat room's current contextual order form)
+	Map<UUID, InquiryListItem.LatestOrderFormSubmission> latestSubmissionByInquiryId =  
+      latestSubmissionByInquiryId(inquiries);  
+  
+  return inquiries.stream()  
+      .map(inquiry -> toSellerItem(  
+          inquiry,  
+          sellerUserId,  
+          store,  
+          buyersById,  
+          profileImageDeliveryUrlByUserId,  
+          latestEventByInquiryId,  
+          latestSubmissionByInquiryId))  
+      .filter(item -> !unreadOnly || item.unreadCount() > 0)  
+      .sorted(byLatestEvent())  
+      .toList();  
+}
+```
+
+#### Problem 2: Looking up the same store twice
+Here I found where the second of the three problems identified in the previous post, `looking up the same store twice`, occurs.
+The line `Store store = inquiries.isEmpty() ? null : findStore(storeId);` is the second lookup.
+The first happens when `StoreContextFilter`, which I looked at earlier, looks up the seller's store and saves its ID. Then `findStore()` in this code looks up the store object again using that ID. So this really is a duplicate lookup of the same store.
+
+However, the filter determines the store ID to use for the request, while the logic that creates the inquiry list uses the store object. I judged that each of these two stages performs a lookup to get the information it needs. Since the DB execution time for a single store lookup was also short, I decided to defer improving this part as well and analyze the next problem.
+
+#### Problem 3: Repeating the unread-item count query 1,002 times for inquiries
+More precisely, rather than saying 1,002 times, the following is accurate.
+`{Number of inquiries retrieved for that store that pass the seller list's display condition and the requested status condition}`
+It occurs here.
+```java
+public List<InquiryListItem> getSellerInquiries(...) {     
+    .
+    .
+    .
+  return inquiries.stream()  
+      .map(inquiry -> toSellerItem(  // <- This method
+          inquiry,  
+          sellerUserId,  
+          store,  
+          buyersById,  
+          profileImageDeliveryUrlByUserId,  
+          latestEventByInquiryId,  
+          latestSubmissionByInquiryId))  
+      .filter(item -> !unreadOnly || item.unreadCount() > 0)  
+      .sorted(byLatestEvent())  
+      .toList();  
+}
+// ============================================================================
+private InquiryListItem toSellerItem(...) {  
+  User buyer = findBuyer(inquiry, buyersById);  
+  .
+  .
+  .
+  return toItem(  // <- This method
+      inquiry,  
+      sellerUserId,  
+      inquiry.getSellerLastReadAt(),  
+      detail,  
+      inquiry.statusForSeller(),  
+      latestEvent,  
+      latestSubmissionByInquiryId.get(inquiry.getId()));  
+}
+// ============================================================================
+private InquiryListItem toItem(...) {       // ⬇️⬇️⬇️
+    long unreadCount = chatTimelineItemPort.countUnread(inquiry.getId(), readerUserId, readAt);
+    Instant latestEventAt = latestEvent == null ? null : latestEvent.createdAt();
+    return InquiryListItem.from(
+        inquiry,
+        detail,
+        status,
+        unreadCount,
+        latestEventAt,
+        latestEvent,
+        latestOrderFormSubmission);
+  }
+```
+To sum it up, this happens while mapping the inquiry list to `InquiryListItem`: the unread count is looked up separately for each inquiry. There were 1,002 target inquiries, so the aggregation SQL also ran 1,002 times. Processing the entire list at once and calling the aggregation SQL for each item both contributed to this.
+
+1. The UI initially shows about 5 items on mobile and about 15 to 20 on desktop, and provides more through infinite scroll. But the current API retrieves, maps, and returns all target inquiries, so the amount of work in one request grows as the data grows.
+2. It runs SQL once for each inquiry to get the number of unread items in that chat room. Therefore, as the number of target inquiries grows, **the number of SQL calls grows at the same rate.**
+Processing the whole list and repeatedly calling SQL for each inquiry are two clear areas for improvement, so I decided to improve this part.
+## Designing the improvement
+### Key solution: Fetch unread-item counts for inquiries in one batch
+Currently, `countUnread()` SQL runs once whenever one inquiry is mapped. I will change this to pass the list of inquiry IDs on the current page and fetch them in one query, receive the result in the form `inquiry ID -> unread-item count`, and put each count into its corresponding item.
+> If there are 20 inquiries on a page, process them with one SQL query that returns the count for each inquiry instead of 20 aggregation SQL queries.
+
+### What to change
+```
+Existing approach
+One inquiry -> countUnread(inquiry ID, seller ID, read time) -> one result
+```
+```
+Changed approach
+Inquiry list -> countUnread(list of query conditions per inquiry, seller ID)
+			-> Map of counts by inquiry ID -> map to each inquiry
+```
+> To determine whether an item has been read, I exclude items sent by the seller from all timeline items in that chat room and count those published after the seller's last read time. If there is no last read time, I count all items sent by the other party.
+
+## Applying the improvement
+### Adding the query condition and port
+
+```java
+public record UnreadCountTarget(UUID inquiryId, Instant readAt) {}
+```
+To implement this change, I needed to send multiple inquiries in one SQL query. For that, I added this to pair each inquiry ID with that inquiry's read time and pass them together.
+
+```java
+long countUnread(UUID inquiryId, UUID readerUserId, Instant readAt); // Existing
+
+Map<UUID, Long> countUnread( // Changed
+    List<UnreadCountTarget> targets,
+    UUID readerUserId); 
+```
+I changed from a single-item method to a list method (I kept the single-item method rather than deleting it because it is used elsewhere).
+
+### Adding SQL that returns the count for each inquiry
+```sql
+with targets(inquiry_id, read_at) as (values ...)
+select targets.inquiry_id, count(item.id) as unread_count
+from targets
+left join chat_timeline_items item
+  on item.inquiry_id = targets.inquiry_id
+ and item.sender_user_id <> ?
+ and (targets.read_at is null or item.created_at > targets.read_at)
+group by targets.inquiry_id
+```
+I made the `inquiry_id` and `read_at` passed for each inquiry into a temporary list called `targets`. Then, taking each inquiry in that list as the basis, I joined it to items in `chat_timeline_items` that belong to the same chat room.
+
+Here, I exclude items sent by the seller. If the last read time for an inquiry is recorded, I join only items created after that time; if it is not recorded, I join all items sent by the other party.
+
+I then group the joined results by inquiry ID and count the timeline items joined to each inquiry. Finally, I return each inquiry ID paired with its unread-item count.
+
+### Fetching the aggregation results in advance when retrieving the list
+```java
+Map<UUID, Long> unreadCountsByInquiryId = chatTimelineItemPort.countUnread(
+    inquiries.stream()
+        .map(inquiry -> new UnreadCountTarget(inquiry.getId(), inquiry.getSellerLastReadAt()))
+        .toList(),
+    sellerUserId);
+```
+Previously, `inquiries.stream().map(...)` called `countUnread()` every time it processed an inquiry. After the change, it fetches the unread counts for all inquiries with one SQL query before starting `map(...)`.
+
+## Testing after the improvement
+### HTTP stage 3 test before the improvement
+![HTTP stage 3 test before the improvement](../../query-optimization/assets/befor-rate3.png)
+
+### HTTP stage 3 test after the improvement
+![HTTP stage 3 test after the improvement](../../query-optimization/assets/after-rate3.png)
+
+> Due to length, I have attached screenshots only for stage 3 of the actual test!
+### Summary of the HTTP tests
+#### Summary after the improvement
+
+| **Main item** | **1 request per second** | **3 requests per second** | **5 requests per second** |
+| --------- | --------- | --------- | --------- |
+| Actual requests | 121 | 361 | 601 |
+| Average response time | 102.81ms | 76.97ms | 69.38ms |
+| p50 response time | 105.18ms | 71.69ms | 66.64ms |
+| p95 response time | 119.62ms | 106.67ms | 91.96ms |
+| Maximum response time | 157.62ms | 195.84ms | 114.10ms |
+| HTTP failures | 0 | 0 | 0 |
+| Response validation | All passed | All passed | All passed |
+| Data received | 94MB | 280MB | 467MB |
+#### Before and after comparison
+| **Metric** | **1 request per second** | **3 requests per second** | **5 requests per second** |
+|---|---|---|---|
+|Average: before → after|302.90 → 102.81ms|255.51 → 76.97ms|267.35 → 69.38ms|
+|Average response speed|About **2.9x**|About **3.3x**|About **3.9x**|
+|p95: before → after|336.84 → 119.62ms|328.44 → 106.67ms|384.94 → 91.96ms|
+The average response time improved by about 2.9 to 3.9 times. What an amazing result!🎉
+
+### Remeasuring SQL execution counts and DB execution time
+
+![Before-and-after comparison of SQL execution counts and DB execution time for unread-item counts](../../query-optimization/assets/inquiry-unread-sql-execution-before-after.png)
+
+#### Before the improvement
+|Item|Result|Meaning|
+|---|---|---|
+|Call count|1,002|Confirmed that it ran once per inquiry|
+|Cumulative DB execution time|6.500ms|The **sum of execution time inside the DB** for 1,002 SQL queries|
+|Average DB execution time|0.0065ms|Average DB execution time for one SQL query|
+## After the improvement
+
+| **Item** | **Result** | **Meaning** |
+| ------------------- | ------- | ------------------------------ |
+| Batched SQL call count | 1 | Aggregate unread-item counts for 1,002 inquiries in one query |
+| Cumulative DB execution time | 2.602ms | The **execution time inside the DB** for this one SQL query |
+| Per-inquiry SQL call count | 0 | The previous repeated lookups are gone |
+In addition to eliminating the repeated lookups, the cumulative DB execution time improved by about 2.5 times.🎉
+
+## What I felt after analyzing and improving it myself
+
+In my previous projects, I tended to look over the code and improve parts that seemed inefficient rather than actually measuring them. But this time, I checked the HTTP response times, SQL logs, SQL execution counts and times, and even the execution plans myself. A lot of these analysis methods were new to me, but the experience of deciding whether to make improvements based on visible results felt valuable.
+
+In particular, I did not stop at guesses such as “this doesn't look good” or “there might be duplicate lookups.” I was able to choose what to improve based on actual numbers. Along with remeasuring the problem after improving it, I also compared the API response times before and after the change under the same conditions to confirm the effect of the improvement.
+
+Through this experience, I felt that looking at code and anticipating a problem is different from **confirming the problem through measurement and then verifying the result of an improvement**. I think that when improving performance in a situation with a fixed time frame and limited resources, priorities and justification need to be considered. I was glad that this experience let me go through that process, both directly and indirectly.
