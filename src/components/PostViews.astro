@@ -1,0 +1,72 @@
+---
+type Props = { path: string; size?: "sm" | "lg" };
+
+const { path, size = "sm" } = Astro.props;
+---
+
+<span
+  class:list={[
+    "text-muted-foreground inline-flex items-center gap-1.5 tabular-nums",
+    size === "lg" ? "text-sm sm:text-base" : "text-sm",
+  ]}
+  data-post-views={path}
+  aria-label="Views"
+>
+  <svg
+    aria-hidden="true"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="1.8"
+    class="size-5"
+  >
+    <path
+      d="M2.5 12s3.4-5.5 9.5-5.5 9.5 5.5 9.5 5.5-3.4 5.5-9.5 5.5S2.5 12 2.5 12Z"
+    ></path>
+    <circle cx="12" cy="12" r="2.5"></circle>
+  </svg>
+  <span data-view-count>—</span>
+  <span>views</span>
+</span>
+
+<script>
+  const counts = new Map<string, Promise<number>>();
+
+  function getViews(path: string) {
+    let pending = counts.get(path);
+    if (!pending) {
+      pending = fetch(`/api/visitors?path=${encodeURIComponent(path)}`)
+        .then(async response => {
+          if (!response.ok) throw new Error("Post views unavailable");
+          const data = (await response.json()) as { views: number };
+          return data.views;
+        })
+        .catch(error => {
+          counts.delete(path);
+          throw error;
+        });
+      counts.set(path, pending);
+    }
+    return pending;
+  }
+
+  function renderPostViews() {
+    document
+      .querySelectorAll<HTMLElement>("[data-post-views]")
+      .forEach(element => {
+        const path = element.dataset.postViews;
+        if (!path) return;
+        void getViews(path)
+          .then(views => {
+            element.querySelector("[data-view-count]")!.textContent =
+              views.toLocaleString();
+          })
+          .catch(() => {
+            // Keep the placeholder if analytics is unavailable.
+          });
+      });
+  }
+
+  document.addEventListener("astro:page-load", renderPostViews);
+  renderPostViews();
+</script>

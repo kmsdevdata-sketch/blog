@@ -1,31 +1,93 @@
----
-type Props = { locale: string };
-
-const { locale } = Astro.props;
-const korean = locale !== "en";
----
-
-<div
-  class="text-muted-foreground flex items-center gap-3 text-xs tabular-nums"
-  data-visitor-stats
-  aria-live="polite"
-  title={korean ? "UTC 날짜 기준" : "Based on UTC dates"}
+<section
+  aria-labelledby="visitors-heading"
+  class="border-border border-b py-8 sm:py-9"
 >
-  <span>
-    {korean ? "오늘 방문자" : "Today"}
-    {" "}
-    <strong class="text-foreground font-medium" data-today-visitors>—</strong>
-  </span>
-  <span aria-hidden="true">·</span>
-  <span>
-    {korean ? "누적 조회" : "Total views"}
-    {" "}
-    <strong class="text-foreground font-medium" data-total-views>—</strong>
-  </span>
-</div>
+  <div class="mb-6 flex items-center justify-between gap-3">
+    <h2
+      id="visitors-heading"
+      class="flex items-center gap-2 text-sm font-semibold tracking-[0.14em] uppercase"
+    >
+      <span class="bg-accent size-2 rounded-full" aria-hidden="true"></span>
+      Visitors
+    </h2>
+    <span class="text-muted-foreground text-xs">Last 7 days / UTC</span>
+  </div>
+
+  <div
+    class="grid grid-cols-2 gap-y-7 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(0,1.5fr)]"
+    data-visitor-stats
+    aria-live="polite"
+  >
+    <div class="border-border border-r pr-4">
+      <p class="text-muted-foreground text-xs tracking-wide">TODAY</p>
+      <strong
+        class="mt-2 block text-4xl leading-none font-semibold tracking-tight tabular-nums"
+        data-today-visitors>—</strong
+      >
+      <p class="text-muted-foreground mt-2 text-xs">visitors</p>
+    </div>
+    <div class="pl-5 md:pl-8">
+      <p class="text-muted-foreground text-xs tracking-wide">ALL TIME</p>
+      <strong
+        class="mt-2 block text-4xl leading-none font-semibold tracking-tight tabular-nums"
+        data-total-views>—</strong
+      >
+      <p class="text-muted-foreground mt-2 text-xs">page views</p>
+    </div>
+    <div
+      class="border-border col-span-2 border-t pt-5 md:col-span-1 md:border-t-0 md:border-l md:pt-0 md:pl-8"
+    >
+      <p class="text-muted-foreground mb-2 text-xs tracking-wide">
+        DAILY VIEWS
+      </p>
+      <svg
+        viewBox="0 0 240 60"
+        preserveAspectRatio="none"
+        class="h-15 w-full overflow-visible"
+        data-daily-chart
+        aria-hidden="true"
+      >
+        <defs>
+          <linearGradient id="traffic-fill" x1="0" x2="0" y1="0" y2="1">
+            <stop
+              offset="0%"
+              stop-color="var(--color-accent)"
+              stop-opacity="0.22"></stop>
+            <stop
+              offset="100%"
+              stop-color="var(--color-accent)"
+              stop-opacity="0"></stop>
+          </linearGradient>
+        </defs>
+        <path data-chart-area fill="url(#traffic-fill)"></path>
+        <path
+          data-chart-line
+          fill="none"
+          stroke="var(--color-accent)"
+          stroke-width="2"
+          vector-effect="non-scaling-stroke"
+          stroke-linecap="round"
+          stroke-linejoin="round"></path>
+        <circle data-chart-current r="3.5" fill="var(--color-accent)"></circle>
+      </svg>
+      <div
+        class="text-muted-foreground mt-1 flex justify-between text-xs tabular-nums"
+      >
+        <span data-chart-start>—</span>
+        <span data-chart-end>—</span>
+      </div>
+      <span class="sr-only" data-chart-description></span>
+    </div>
+  </div>
+</section>
 
 <script>
-  type VisitorCounts = { todayVisitors: number; totalViews: number };
+  type DailyView = { date: string; views: number };
+  type VisitorCounts = {
+    todayVisitors: number;
+    totalViews: number;
+    dailyViews: DailyView[];
+  };
 
   let pending: Promise<VisitorCounts> | undefined;
   let fetchedAt = 0;
@@ -51,14 +113,42 @@ const korean = locale !== "en";
     if (!root) return;
 
     void getCounts()
-      .then(({ todayVisitors, totalViews }) => {
+      .then(({ todayVisitors, totalViews, dailyViews }) => {
         root.querySelector("[data-today-visitors]")!.textContent =
           todayVisitors.toLocaleString();
         root.querySelector("[data-total-views]")!.textContent =
           totalViews.toLocaleString();
+
+        if (dailyViews?.length !== 7) return;
+        const max = Math.max(1, ...dailyViews.map(day => day.views));
+        const points = dailyViews.map(({ views }, index) => ({
+          x: index * 40,
+          y: 52 - (views / max) * 44,
+        }));
+        const line = points
+          .map(({ x, y }, index) => `${index === 0 ? "M" : "L"}${x} ${y}`)
+          .join(" ");
+        root.querySelector("[data-chart-line]")!.setAttribute("d", line);
+        root
+          .querySelector("[data-chart-area]")!
+          .setAttribute("d", `${line} L240 60 L0 60 Z`);
+        root
+          .querySelector("[data-chart-current]")!
+          .setAttribute("cx", String(points[6].x));
+        root
+          .querySelector("[data-chart-current]")!
+          .setAttribute("cy", String(points[6].y));
+        root.querySelector("[data-chart-start]")!.textContent =
+          dailyViews[0].date.slice(5).replace("-", "/");
+        root.querySelector("[data-chart-end]")!.textContent = dailyViews[6].date
+          .slice(5)
+          .replace("-", "/");
+        root.querySelector("[data-chart-description]")!.textContent = dailyViews
+          .map(day => `${day.date}: ${day.views}`)
+          .join(", ");
       })
       .catch(() => {
-        // Leave the placeholder in place when analytics is unavailable.
+        // Leave placeholders when analytics is unavailable.
       });
   }
 
