@@ -33,16 +33,18 @@ const homePath = getRelativeLocaleUrl(locale, "");
     class="app-layout my-1"
   >
     <section id="hero" class="border-border border-b pt-8 pb-6">
-      <div class="my-4 flex items-center gap-5 sm:my-8">
+      <div
+        class="my-4 grid grid-cols-[auto_minmax(0,1fr)] items-center gap-x-5 gap-y-3 sm:my-8 sm:grid-cols-[auto_minmax(0,1fr)_auto]"
+      >
         <img
           src="/profile.png"
           alt="Minseo Kim"
           class="h-20 w-20 rounded-full object-cover sm:h-24 sm:w-24"
         />
 
-        <div>
+        <div class="min-w-0">
           <div class="flex items-center gap-3">
-            <h1 class="text-4xl font-bold sm:text-5xl">Minseo Kim</h1>
+            <h1 class="text-3xl font-bold sm:text-5xl">Minseo Kim</h1>
 
             <a
               target="_blank"
@@ -62,6 +64,13 @@ const homePath = getRelativeLocaleUrl(locale, "");
 
           <p class="text-muted-foreground mt-2">Backend Developer</p>
         </div>
+
+        <a
+          href={getRelativeLocaleUrl(locale, "about")}
+          class="text-foreground hover:text-accent col-span-2 inline-flex items-center gap-1 justify-self-end self-end text-sm font-medium decoration-dashed underline-offset-4 hover:underline sm:col-span-1"
+        >
+          About me <IconArrowRight class="text-accent size-4 rtl:-rotate-180" />
+        </a>
       </div>
 
       <p class="text-lg">

@@ -1,5 +1,6 @@
 ---
 import type { HTMLAttributes } from "astro/types";
+import { getRelativeLocaleUrl } from "astro:i18n";
 import Socials from "./Socials.astro";
 import { useTranslations } from "@/i18n";
 
@@ -9,7 +10,8 @@ type Props = {
 
 const { noMarginTop = false, class: className, ...attrs } = Astro.props;
 
-const t = useTranslations(Astro.currentLocale);
+const locale = Astro.currentLocale ?? "ko";
+const t = useTranslations(locale);
 const currentYear = new Date().getFullYear();
 ---
 
@@ -20,7 +22,15 @@ const currentYear = new Date().getFullYear();
   <div
     class="border-border flex flex-col items-center justify-between border-t py-6 sm:flex-row-reverse sm:py-4"
   >
-    <Socials />
+    <div class="flex items-center gap-4">
+      <a
+        href={getRelativeLocaleUrl(locale, "about")}
+        class="text-muted-foreground hover:text-accent text-sm decoration-dashed underline-offset-4 hover:underline"
+      >
+        About
+      </a>
+      <Socials />
+    </div>
     <div class="my-2 flex flex-col items-center gap-2 sm:items-start">
       <div class="flex flex-col items-center whitespace-nowrap sm:flex-row">
         <span>{t.footer.copyright} &#169; {currentYear}</span>
