@@ -9,6 +9,7 @@ const korean = locale !== "en";
   class="text-muted-foreground flex items-center gap-3 text-xs tabular-nums"
   data-visitor-stats
   aria-live="polite"
+  title={korean ? "UTC 날짜 기준" : "Based on UTC dates"}
 >
   <span>
     {korean ? "오늘 방문자" : "Today"}
@@ -30,7 +31,7 @@ const korean = locale !== "en";
   let fetchedAt = 0;
 
   function getCounts() {
-    if (!pending || Date.now() - fetchedAt > 300_000) {
+    if (!pending || Date.now() - fetchedAt > 60_000) {
       fetchedAt = Date.now();
       pending = fetch("/api/visitors")
         .then(async response => {

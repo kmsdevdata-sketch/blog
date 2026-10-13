@@ -6,23 +6,25 @@ type AnalyticsCount = {
   data?: { pageviews?: unknown; visitors?: unknown };
 };
 
-function startOfTodayInSeoul(now: Date): number {
-  const date = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Asia/Seoul",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  }).format(now);
-  return new Date(`${date}T00:00:00+09:00`).getTime();
+function utcToday(now: Date) {
+  const since = Date.UTC(
+    now.getUTCFullYear(),
+    now.getUTCMonth(),
+    now.getUTCDate()
+  );
+  return { since, until: since + 24 * 60 * 60 * 1000 };
 }
 
-async function getCount(token: string, since?: number) {
+async function getCount(
+  token: string,
+  range?: { since: number; until: number }
+) {
   const url = new URL(analyticsUrl);
   url.searchParams.set("projectId", projectId);
   url.searchParams.set("slug", teamSlug);
-  if (since !== undefined) {
-    url.searchParams.set("since", String(since));
-    url.searchParams.set("until", String(Date.now()));
+  if (range) {
+    url.searchParams.set("since", String(range.since));
+    url.searchParams.set("until", String(range.until));
   }
 
   const response = await fetch(url, {
@@ -51,13 +53,13 @@ export async function GET() {
 
   try {
     const [today, lifetime] = await Promise.all([
-      getCount(token, startOfTodayInSeoul(new Date())),
+      getCount(token, utcToday(new Date())),
       getCount(token),
     ]);
 
     return Response.json(
       { todayVisitors: today.visitors, totalViews: lifetime.pageviews },
-      { headers: { "Cache-Control": "public, s-maxage=300, stale-while-revalidate=600" } }
+      { headers: { "Cache-Control": "public, s-maxage=60, stale-while-revalidate=120" } }
     );
   } catch (error) {
     console.error("Unable to load visitor counts", error);
