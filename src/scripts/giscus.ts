@@ -42,7 +42,7 @@ function mountGiscus() {
     reactionsEnabled: "1",
     emitMetadata: "0",
     inputPosition: "top",
-    loading: "lazy",
+    loading: "eager",
     theme: theme(),
     lang: container.dataset.lang,
   });

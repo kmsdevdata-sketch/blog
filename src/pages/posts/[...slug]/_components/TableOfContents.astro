@@ -1,0 +1,122 @@
+---
+import type { MarkdownHeading } from "astro";
+
+type Props = {
+  headings: MarkdownHeading[];
+  locale: string;
+};
+
+const { headings, locale } = Astro.props;
+const label = locale === "ko" ? "목차" : "On this page";
+---
+
+{
+  headings.length > 1 && (
+    <>
+      <details
+        class="border-border mb-8 border-y py-3 xl:hidden"
+        data-pagefind-ignore
+      >
+        <summary class="text-muted-foreground marker:text-accent cursor-pointer text-sm font-semibold">
+          {label}
+        </summary>
+        <nav aria-label={label} class="pt-3">
+          <ol class="border-border border-l text-sm leading-6">
+            {headings.map(heading => (
+              <li>
+                <a
+                  href={`#${heading.slug}`}
+                  data-toc-slug={heading.slug}
+                  class:list={[
+                    "text-muted-foreground hover:text-accent focus-visible:text-accent aria-[current=location]:text-accent aria-[current=location]:border-accent block border-l-2 border-transparent py-1 no-underline transition-colors aria-[current=location]:font-semibold",
+                    heading.depth === 3 ? "pl-6" : "pl-3",
+                  ]}
+                >
+                  {heading.text}
+                </a>
+              </li>
+            ))}
+          </ol>
+        </nav>
+      </details>
+
+      <aside
+        class="absolute inset-y-0 left-full ml-6 hidden w-52 xl:block"
+        data-pagefind-ignore
+      >
+        <nav
+          aria-label={label}
+          class="sticky top-24 max-h-[calc(100vh-8rem)] overflow-y-auto"
+        >
+          <p class="text-muted-foreground mb-3 text-xs font-semibold tracking-wide uppercase">
+            {label}
+          </p>
+          <ol class="border-border border-l text-sm leading-5">
+            {headings.map(heading => (
+              <li>
+                <a
+                  href={`#${heading.slug}`}
+                  data-toc-slug={heading.slug}
+                  class:list={[
+                    "text-muted-foreground hover:text-accent focus-visible:text-accent aria-[current=location]:text-accent aria-[current=location]:border-accent block border-l-2 border-transparent py-1.5 no-underline transition-colors aria-[current=location]:font-semibold",
+                    heading.depth === 3 ? "pl-6" : "pl-3",
+                  ]}
+                >
+                  {heading.text}
+                </a>
+              </li>
+            ))}
+          </ol>
+        </nav>
+      </aside>
+    </>
+  )
+}
+
+<script>
+  let controller: AbortController | undefined;
+
+  function initToc() {
+    controller?.abort();
+    controller = new AbortController();
+
+    const links = Array.from(
+      document.querySelectorAll<HTMLAnchorElement>("[data-toc-slug]")
+    );
+    if (!links.length) return;
+
+    const headings = Array.from(
+      document.querySelectorAll<HTMLElement>("#article h2, #article h3")
+    ).filter(heading => heading.id);
+
+    let scheduled = false;
+    const update = () => {
+      scheduled = false;
+      const current =
+        headings.findLast(heading => heading.getBoundingClientRect().top <= 144)
+          ?.id ?? headings[0]?.id;
+
+      for (const link of links) {
+        const active = link.dataset.tocSlug === current;
+        if (active) link.setAttribute("aria-current", "location");
+        else link.removeAttribute("aria-current");
+      }
+    };
+    const schedule = () => {
+      if (!scheduled) {
+        scheduled = true;
+        requestAnimationFrame(update);
+      }
+    };
+
+    window.addEventListener("scroll", schedule, {
+      passive: true,
+      signal: controller.signal,
+    });
+    window.addEventListener("resize", schedule, { signal: controller.signal });
+    schedule();
+  }
+
+  document.addEventListener("astro:page-load", initToc);
+  initToc();
+</script>
