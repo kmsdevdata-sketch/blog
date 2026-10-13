@@ -1,0 +1,66 @@
+---
+type Props = { locale: string };
+
+const { locale } = Astro.props;
+const korean = locale !== "en";
+---
+
+<div
+  class="text-muted-foreground flex items-center gap-3 text-xs tabular-nums"
+  data-visitor-stats
+  aria-live="polite"
+>
+  <span>
+    {korean ? "오늘 방문자" : "Today"}
+    {" "}
+    <strong class="text-foreground font-medium" data-today-visitors>—</strong>
+  </span>
+  <span aria-hidden="true">·</span>
+  <span>
+    {korean ? "누적 조회" : "Total views"}
+    {" "}
+    <strong class="text-foreground font-medium" data-total-views>—</strong>
+  </span>
+</div>
+
+<script>
+  type VisitorCounts = { todayVisitors: number; totalViews: number };
+
+  let pending: Promise<VisitorCounts> | undefined;
+  let fetchedAt = 0;
+
+  function getCounts() {
+    if (!pending || Date.now() - fetchedAt > 300_000) {
+      fetchedAt = Date.now();
+      pending = fetch("/api/visitors")
+        .then(async response => {
+          if (!response.ok) throw new Error("Visitor counts unavailable");
+          return (await response.json()) as VisitorCounts;
+        })
+        .catch(error => {
+          pending = undefined;
+          throw error;
+        });
+    }
+    return pending;
+  }
+
+  function renderCounts() {
+    const root = document.querySelector<HTMLElement>("[data-visitor-stats]");
+    if (!root) return;
+
+    void getCounts()
+      .then(({ todayVisitors, totalViews }) => {
+        root.querySelector("[data-today-visitors]")!.textContent =
+          todayVisitors.toLocaleString();
+        root.querySelector("[data-total-views]")!.textContent =
+          totalViews.toLocaleString();
+      })
+      .catch(() => {
+        // Leave the placeholder in place when analytics is unavailable.
+      });
+  }
+
+  document.addEventListener("astro:page-load", renderCounts);
+  renderCounts();
+</script>
