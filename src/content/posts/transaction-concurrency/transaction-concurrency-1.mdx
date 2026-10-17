@@ -1,0 +1,252 @@
+---
+title: "트랜잭션과 동시성 1편: 결제 승인 흐름 분석과 검증 가설"
+lang: ko
+translationKey: transaction-concurrency-1
+pubDatetime: 2026-10-17T17:20:00+09:00
+category: "Spring"
+featured: false
+draft: false
+tags:
+  - Transaction
+  - Concurrency
+  - Payment
+  - Data Consistency
+  - Spring Boot
+description: "결제 승인 API의 트랜잭션·동시성 검증 조건을 정의하고 현재 구현을 분석해, 외부 결제 승인과 내부 DB 처리 사이의 실패 상황을 다음 검증 가설로 정리합니다."
+---
+
+import GitHubRepoCard from "@/components/GitHubRepoCard.astro";
+
+지난번 쿼리 최적화 작업을 해보면서 ([쿼리 최적화](https://www.beingbe.tech/posts/query-optimization/query-optimization-1/)) 이참에 트랜잭션 및 동시성 개선 프로세스도 경험해보려 계획했다. 이번에도 대상 프로젝트는 이전에 진행했던 위하다 프로젝트(주문제작 케이크 매장의 상담·주문·결제를 한 흐름으로 관리하는 서비스)를 대상으로 선정했다.
+
+<GitHubRepoCard
+  repo="kmsdevdata-sketch/wihada-api"
+  title="위하다 API"
+  description="주문제작 케이크 매장의 상담·주문·결제 과정을 하나의 흐름으로 관리하는 백엔드 서비스"
+  previewImage="https://opengraph.githubassets.com/36f383c6d65701da09b0d3232d6d309021d2c7699d9e48818247aeaf6904a4a2/kmsdevdata-sketch/wihada-api"
+/>
+
+> [!info] 트랜잭션과 동시성 시리즈
+>
+> **1편 · 결제 승인 흐름 분석과 검증 가설**
+
+> 해당 포스트에서 테스트 및 개선은 배포환경이 아닌 로컬 어플리케이션 기준으로 실시되었습니다!
+
+---
+
+## 분석 대상 후보군 선정 
+
+우선 분석및 개선 후보군을 선정하기 위해서 아래 사항을 기준으로 먼저 탐색하였다.
+- DB데이터를 변경하는 API 중 **여러 데이터**의 변경이 하나의 작업으로 묶임 
+- 동일한 데이터에 요청이 **동시에** 들어올 수 있는 기능
+> 물론 단일 데이터 변경도 트랜잭션이 적용되지만 **원자성 보장의 필요성** 과 **실패시 발생하는 문제 분석의 다양성** 을 위해 여러 데이터 변경이 학습가치가 높다고 판단하였습니다!
+
+API목록 파악및 분류는 Codex를 사용하였고 아래와 같이 API목록이 추려졌다.
+
+| 후보 기능           | API                                                         | 여러 데이터가 함께 변경되는 부분                      | 같은 데이터에 요청이 겹치는 상황            |
+| --------------- | ----------------------------------------------------------- | --------------------------------------- | ----------------------------- |
+| **결제 승인**       | `POST /payment-attempts/{paymentAttemptId}/capture`         | 결제 시도·주문확인서·문의·주문·상태 이력·알림·타임라인 등이 연결됨  | 같은 결제 시도에 승인 요청이 중복 도착        |
+| **판매자 환불**      | `POST /seller/orders/{orderId}/refund`                      | 환불 내역·주문 상태·상태 이력·알림·타임라인 변경과 외부 결제사 호출 | 같은 주문에 환불 요청이 겹침              |
+| **주문확인서 발송**    | `POST /seller/inquiries/{inquiryId}/confirmations`          | 새 확인서 저장, 이전 확인서 상태 변경, 알림·타임라인 생성      | 같은 문의에 확인서를 동시에 발송            |
+| **주문서 초안 사용**   | `POST /order-form-drafts/{draftKey}/consume`                | 문의방 생성·재사용, 주문서 제출, 타임라인 생성, 초안 삭제      | 같은 `draftKey`로 두 번 사용 요청      |
+| **판매자 가입 승인**   | `PATCH /operator/seller-onboardings/{onboardingId}/approve` | 가입 상태 변경과 스토어 생성                        | 같은 신청을 동시에 승인하거나 승인·거절 요청이 겹침 |
+| **판매자 영업시간 변경** | `PUT /seller/stores/business-hours`                         | 요일별 설정을 교체하고 스토어의 영업시간 표시값도 변경          | 같은 스토어의 설정 변경 요청이 겹침          |
+| **스토어 생성**      | `POST /seller/stores`                                       | 스토어와 기본 운영 설정 생성                        | 같은 판매자의 생성 요청이 겹침             |
+
+약 7개의 후보군이 있는데 이중에서 분석후보는 한가지만 선택하여 진행하려 한다.
+후보선택의 비교군은 `비즈니스 중요도`,`데이터 정합성`,`동시성 검증`,`학습 가치`를 중점적으로 살폈으며,결론적으로 `결제 승인` 기능을 분석하기로 선택하였다. 해당 기능 선택한 이유는 아래와 같다.
+1. 핵심 비즈니스 프로세스 : 결제 승인은 주문 확정과 연결되는 서비스의 핵심 기능이며,처리 결과가 이후 비즈니스 흐름에 직접적인 영향을 미침.
+2. 데이터 정합성 중요도 : 결제 승인 과정에서 결제 시도,주문,상태 이력 등 여러 데이터가 함께 변경되므로,작업 중 일부 실패가 발생했을때 데이터 정합성 유지의 증요도가 높음 
+3. 외부 시스템과의 정합성 : 외부 PG의 결제 승인 결과와 내부 DB의 상태를 일관되게 관리해야 하며, 특히 외부 결제 승인 이후 내부 DB 변경에 실패하는 상황은 일반적인 DB 트랜잭션의 롤백만으로 해결할 수 없으므로, 실패 처리 및 복구 구조를 분석할 가치가 높다고 판단
+>물론 다른 기능에서도 데이터 정합성과 동시성에 대한 신뢰성을 확보하는 것은 중요하다고 생각합니다. 다만 이번 개선 작업의 주된 목적은 **"트랜잭션 및 동시성 문제를 분석하고 해결하는 과정을 경험하며 관련 기술을 학습하는 것"**이므로, 다양한 실패 시나리오와 동시성 문제를 검증할 수 있는 결제 승인 기능을 우선 선정하였습니다!
+
+---
+## 검증할 결제 처리 조건
+분석대상이 `결제 승인` 으로 정해졌고 분석에 들어가기에 앞서 해당 API가 지켜져야할 결과와 실패 상황을 정의하여 해당 내용에 맞춰 구현 분석및 개선사항을 파악하면 좋을것 같다고 판단하였다.
+
+### `/payment-attempts/{paymentAttemptId}/capture` 
+해당 API는 이미 준비된 결제 시도를 최종 승인 -> **Wihada** 의 주문으로 반영하는 API이다.
+구매자 `paymentAttemptId` 와 세션 정보를 보내면,서버가 요청자와 세션을 검증하고 결제사에 승인 결과를 확인하는 역할이다.
+
+실행에 따른 처리 조건은 아래와 같다 
+#### 승인 성공 
+- 결제 시도가 `SUCCEEDED`가 되고 주문이 생성된다. 
+  주문확인서도 결제 완료로 바뀌며 주문 상태 이력·알림·채팅 타임라인이 기록된다.
+#### 일반적인 예외 상황
+##### 같은 결제 시도 재요청
+- 기존 주문 ID를 반환하고,외부 승인이나 주문·완료 알림을 중복 생성하지 않는다.
+##### 승인 결과가 아직 불확실함
+- `NEEDS_CONFIRMATION`으로 두고,다음 요청에서 세션 상태를 다시 확인한다.
+##### 승인 실패 또는 세션 만료 
+- 결제 시도를 실패 상태로 처리하고 주문을 생성하지 않는다.
+##### 요청자/세션이 일치하지 않음
+- 승인 요청을 진행하지 않고 바로 거절한다.
+#### 외부 결제 승인 후 내부 DB 처리 실패 - `트랜잭션 실패`
+- 외부 결제는 승인됐는데 내부 주문이 없는 상태가 **해결되지 않은 채로 남아서는 안 된다.**
+- 결과를 다시 확인하고 내부 처리를 완료할 때, 해당 결제에 대응하는 주문은 **한 건만** 생성되어야 한다.
+#### 같은 결제 시도에 동시 승인 요청 - `동시 요청`
+- 두 요청이 거의 동시에 들어와도 외부 승인 요청, 주문 생성, 완료 알림과 타임라인 기록이 중복되지 않아야 한다.
+- 두 요청이 최종적으로 같은 결제 결과와 주문을 확인할 수 있어야 한다.
+
+---
+## 현재 구현 분석 
+### Controller
+```java
+@PostMapping("/payment-attempts/{paymentAttemptId}/capture")  
+public ApiResponse<PaymentCaptureResponse> capture(  
+    @PathVariable UUID paymentAttemptId,  
+    @Valid @RequestBody PaymentCaptureRequest request,  
+    @Authenticated CurrentUser currentUser) {  
+  RoleGuard.requireBuyer(currentUser);  
+  return ApiResponse.ok(  
+      PaymentCaptureResponse.from(paymentCaptureUseCase.capture(CapturePaymentCommand.of(  
+          paymentAttemptId, currentUser.userId(), request.sessionId(), request.payerId()))));  
+}
+```
+
+### UseCase 구현체
+```java
+  @Override
+  public PaymentCaptureResult capture(CapturePaymentCommand command) {
+	// 결제 세션 ID 혹은 결제자 ID가 비어있을경우 예외발생
+    validateCaptureMessage(command);
+
+	// 결제 시도 가져오기 
+    PaymentAttempt paymentAttempt = getPaymentAttempt(command.paymentAttemptId());
+
+	// 결제 시도에 저장된 구매자 ID와 요청 구매자 ID비교  
+    validateCaptureOwner(paymentAttempt, command.buyerUserId());
+	// 결제 시도에 저장된 세션 ID와 요청 세션 ID 비교 
+    validateSession(paymentAttempt, command.sessionId());
+    
+	// 이 결제 시도로 이미 생성된 주문이 있는지 확인
+	// 재요청 시 기존 주문 ID를 반환하는 데 사용
+    Optional<Order> existingOrder =
+        orderPersistencePort.findByPaymentAttemptId(paymentAttempt.getId());
+
+	// 이전 승인 요청의 결과가 불확실한 상태라면
+	// 결제사에서 기존 결제 세션의 상태를 다시 조회해 결과를 확정
+    if (paymentAttempt.needsConfirmation()) {
+      return reconcilePayment(paymentAttempt, command.payerId());
+    }
+
+	// READY가 아니라면 승인 요청을 다시 보내지 않고 현재 결과를 반환
+    if (!paymentAttempt.isReady()) {
+      return PaymentCaptureResult.of(
+          paymentAttempt, existingOrder.map(Order::getId).orElse(null));
+    }
+
+	// 결제시도의 만료시간이 지났다면 결제 시도를 실패로 변경 -> 실패코드 반환
+    if (Instant.now(clock).isAfter(paymentAttempt.getExpiresAt())) {
+      paymentAttempt.fail("PAYMENT_SESSION_EXPIRED", Instant.now(clock));
+      return PaymentCaptureResult.of(paymentAttempt, null);
+    }
+	// 결제 시도를 승인 진행 상태로 변경하고 결제사에 승인을 요청
+    paymentAttempt.startCapture();
+    Point3CaptureResult captureResult = requestCapture(paymentAttempt.getPoint3SessionId());
+    
+	// 결제사가 응답한 세션 ID를 확인한 뒤 승인 결과를 내부 상태에 반영
+    validatePoint3Session(paymentAttempt, captureResult);
+    return applyCaptureResult(paymentAttempt, command.payerId(), captureResult);
+  }
+```
+
+#### 결제 승인 결과에 따른 후속 처리 
+```java
+private PaymentCaptureResult applyCaptureResult(  
+    PaymentAttempt paymentAttempt, String payerId, Point3CaptureResult captureResult) {  
+    
+  // 결제사 결과 CAPTURED(= 결제사 결제 완료판단)라면 결제완료 후속 처리 
+  if (captureResult.status() == Point3CaptureResult.Status.CAPTURED) {  
+    return completePayment(paymentAttempt, payerId);  
+  }  
+   
+  Instant completedAt = Instant.now(clock);  
+  
+  // 결제사 결과 실패라면 결제 시도를 FAILED로 변경하고 실패 코드 저장
+  if (captureResult.status() == Point3CaptureResult.Status.FAILED) {  
+    paymentAttempt.fail(captureResult.failureCode(), completedAt);  
+  } else { // 그 외(결제 진행중)라면 결제 시도를 NEEDS_CONFIRMATION(결과 확인필요)으로 변경 
+    paymentAttempt.needConfirmation(captureResult.failureCode(), completedAt);  
+  }  
+  
+  return PaymentCaptureResult.of(paymentAttempt, null);  
+}
+```
+
+```java
+private PaymentCaptureResult completePayment(PaymentAttempt paymentAttempt, String payerId) {  
+  Instant completedAt = Instant.now(clock);  
+  
+  OrderConfirmation confirmation = orderConfirmationPersistencePort  
+      .findById(paymentAttempt.getConfirmationId())  
+      .orElseThrow(  
+          () -> new BaseException(OrderConfirmationErrorCode.ORDER_CONFIRMATION_NOT_FOUND));  
+  
+  Inquiry inquiry = inquiryChatAccessService.getBuyerInquiry(  
+      confirmation.getInquiryId(), paymentAttempt.getPayerUserId());  
+  
+  User payer = userPersistencePort  
+      .findById(paymentAttempt.getPayerUserId())  
+      .orElseThrow(() -> new BaseException(CommonErrorCode.UNAUTHORIZED));  
+  
+  // 결제 성공 처리 
+  paymentAttempt.succeed(payerId, completedAt);  
+  // 결제사에서 발급하는 결제주체 ID 연결
+  payer.connectPayer(payerId);
+  // 주문서 확인서 결제 완료 변경  
+  confirmation.markPaid();  
+  // 현재 주문상담이 이뤄진 채팅방의 컨텍스트 주문서 제출 건의 결제일때만 문의상태를 결제완료로 변경
+  // 이미결제 처리되었거나 , 픽업완료된 채팅방이면 false반환하고 상태변경 하지않음
+  inquiry.markPaidIfCurrent(confirmation.getOrderFormSubmissionId());  
+  // 문의에 등록된 주문 시작 참조 이미지의 ID/출처 등을 주문에 보관할 문자열 스냅샷
+  String startReferenceAssets = orderStartReferenceAssetService.createOrderReferenceAssetSnapshot(  
+      confirmation.getInquiryId());  
+  // 주문 생성
+  Order order = orderPersistencePort  
+      .findByPaymentAttemptId(paymentAttempt.getId())  
+      .orElseGet(() -> orderPersistencePort.save(Order.create(  
+          inquiry.getStoreId(),  
+          paymentAttempt.getPayerUserId(),  
+          confirmation.getInquiryId(),  
+          confirmation.getId(),  
+          paymentAttempt.getId(),  
+          createOrderNumber(paymentAttempt),  
+          confirmation.getMenuName(),  
+          confirmation.getOptionSummary(),  
+          startReferenceAssets,  
+          paymentAttempt.getAmount(),  
+          confirmation.getPickupAt())));  
+  // 주문의 최초 상태 이력 생성
+  orderStatusHistoryPersistencePort.save(OrderStatusHistory.create(  
+      order.getId(),  
+      null,  
+      order.getStatus(),  
+      paymentAttempt.getPayerUserId(),  
+      "PAYMENT_SUCCEEDED",  
+      completedAt));  
+  // 스냅샷을 주문에 담은 뒤 문의에 임시로 연결돼 있던 주문 시작 참조 이미지 기록 삭제 
+  orderStartReferenceAssetService.clear(inquiry.getId());  
+  // 구매자 판매자 양쪽에 결제 완료 알림 생성 - DB트랜잭션 이후 실시간 알림 SSE전달 
+  notifyPaymentCompleted(inquiry, order);  
+  // 결제완료 타임라인 아이템 발행
+  chatTimelineItemPublisher.publishPaymentCompleted(  
+      inquiry.getId(), paymentAttempt.getPayerUserId(), order.getId());  
+  
+  return PaymentCaptureResult.of(paymentAttempt, order.getId());  
+}
+```
+
+---
+## 검증 가설 세우기 
+기존에는 결제 승인 과정의 트랜잭션과 동시성 처리 전반을 개선 대상으로 생각했다.
+구현을 살펴보니 결제 시도 상태 변경,주문 생성,이력·알림 저장 등 내부 DB 작업은 하나의 트랜잭션에서 처리하도록 잘 구성되어 있다고 판단된다.
+따라서 여기서 더 확인해볼 부분은 **외부 결제 승인과 내부 DB 트랜잭션 사이의 경계**라고 생각된다.
+
+외부 결제사가 승인을 완료한 뒤 내부 DB처리에서 실패하면, DB 변경은 롤백되더라도 외부 승인까지 함께 롤백은 불가하다.따라서 다음으로는 위 상태에서 같은 결제 시도로 다시 요청했을 때 외부 승인과 주문 생성이 어떻게 처리되는지 검증해보려 한다.
+
+| 실행 구간     | 작업          | 실패 시 되돌릴 수 있는 범위    |
+| --------- | ----------- | ------------------- |
+| DB 트랜잭션 안 | 결제 시도 상태 변경 | 트랜잭션 롤백 대상          |
+| 외부 결제사    | 결제 승인 요청    | Wihada DB 롤백 대상이 아님 |
+| DB 트랜잭션 안 | 주문·이력·알림 저장 | 트랜잭션 롤백 대상          |

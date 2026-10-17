@@ -1,0 +1,252 @@
+---
+title: "Transactions and Concurrency, Part 1: Analyzing the Payment Capture Flow and Forming a Hypothesis to Test"
+lang: en
+translationKey: transaction-concurrency-1
+pubDatetime: 2026-10-17T17:20:00+09:00
+category: "Spring"
+featured: false
+draft: false
+tags:
+  - Transaction
+  - Concurrency
+  - Payment
+  - Data Consistency
+  - Spring Boot
+description: "I define the transaction and concurrency conditions to test for the payment capture API, analyze its current implementation, and turn the failure between external payment capture and internal DB processing into the next hypothesis to test."
+---
+
+import GitHubRepoCard from "@/components/GitHubRepoCard.astro";
+
+After working on query optimization last time ([Query Optimization](/en/posts/query-optimization/query-optimization-1/)), I planned to take this opportunity to experience the process of improving transactions and concurrency as well. This time, too, I chose the Wihada project I had worked on before (a service that manages consultation, orders, and payments for custom cake shops in one flow) as the target project.
+
+<GitHubRepoCard
+  repo="kmsdevdata-sketch/wihada-api"
+  title="Wihada API"
+  description="A backend service that manages consultation, ordering, and payment for custom cake shops in one flow"
+  previewImage="https://opengraph.githubassets.com/36f383c6d65701da09b0d3232d6d309021d2c7699d9e48818247aeaf6904a4a2/kmsdevdata-sketch/wihada-api"
+/>
+
+> [!info] Transactions and Concurrency Series
+>
+> **Part 1 · Analyzing the Payment Capture Flow and Forming a Hypothesis to Test**
+
+> The testing and improvements in this post were carried out against the local application, not the deployed environment!
+
+---
+
+## Choosing Candidate Features to Analyze
+
+First, to choose candidates for analysis and improvement, I explored the APIs based on the following criteria.
+- An API that changes DB data where changes to **multiple pieces of data** are grouped into one operation
+- A feature where requests for the same data can arrive **concurrently**
+> Of course, transactions also apply to changes to a single piece of data, but I judged that changing multiple pieces of data would be more valuable for learning because of **the need to guarantee atomicity** and **the variety of problems to analyze when a failure occurs**!
+
+I used Codex to identify and classify the APIs, and the following API list came out of that process.
+
+| Candidate feature | API | What changes together across multiple pieces of data | When requests overlap for the same data |
+| --------------- | ----------------------------------------------------------- | --------------------------------------- | ----------------------------- |
+| **Payment capture** | `POST /payment-attempts/{paymentAttemptId}/capture` | The payment attempt, order confirmation, inquiry, order, status history, notifications, timeline, and more are connected | Duplicate capture requests arrive for the same payment attempt |
+| **Seller refund** | `POST /seller/orders/{orderId}/refund` | Refund records, order status, status history, notifications, and timeline change, along with a call to the external payment provider | Refund requests overlap for the same order |
+| **Sending an order confirmation** | `POST /seller/inquiries/{inquiryId}/confirmations` | A new confirmation is saved, the previous confirmation's status changes, and notifications and timeline items are created | Confirmations are sent concurrently for the same inquiry |
+| **Consuming an order form draft** | `POST /order-form-drafts/{draftKey}/consume` | An inquiry chat room is created or reused, the order form is submitted, a timeline item is created, and the draft is deleted | Two requests try to consume the same `draftKey` |
+| **Approving seller onboarding** | `PATCH /operator/seller-onboardings/{onboardingId}/approve` | The onboarding status changes and a store is created | The same application is approved concurrently, or approval and rejection requests overlap |
+| **Changing seller business hours** | `PUT /seller/stores/business-hours` | Settings for each day of the week are replaced, and the store's displayed business hours also change | Settings change requests overlap for the same store |
+| **Creating a store** | `POST /seller/stores` | A store and its default operating settings are created | Creation requests overlap for the same seller |
+
+There are about seven candidates, and I intend to pick just one of them for the analysis.
+When comparing the candidates, I focused on `business importance`, `data consistency`, `concurrency verification`, and `learning value`; in the end, I chose to analyze the `payment capture` feature. Here are the reasons I chose it.
+1. Core business process: Payment capture is a core feature of the service that connects to order confirmation, and its result directly affects the subsequent business flow.
+2. Importance of data consistency: The payment attempt, order, status history, and several other pieces of data change together during payment capture, so maintaining data consistency is especially important if part of the operation fails.
+3. Consistency with an external system: The capture result from the external payment provider and the internal DB state must be managed consistently. In particular, if an internal DB change fails after the external payment has been captured, a normal DB transaction rollback alone cannot resolve it, so I judged that the failure handling and recovery structure would be worth analyzing.
+> Of course, I think it is important to make data consistency and concurrency reliable in the other features as well. But the main purpose of this improvement work is **"to experience the process of analyzing and solving transaction and concurrency problems while learning the related techniques"**, so I chose payment capture first because it lets me verify a variety of failure scenarios and concurrency problems!
+
+---
+## Payment Processing Conditions to Verify
+With `payment capture` chosen as the analysis target, I thought it would be good to define the results this API must produce and the failure situations it must handle before starting the analysis, then examine the implementation and identify improvements against those conditions.
+
+### `/payment-attempts/{paymentAttemptId}/capture`
+This API gives final approval to a prepared payment attempt -> and reflects it as an order in **Wihada**.
+When the buyer sends a `paymentAttemptId` and session information, the server verifies the requester and session and checks the capture result with the payment provider.
+
+The processing conditions for each outcome are as follows.
+#### Successful capture
+- The payment attempt becomes `SUCCEEDED`, and an order is created.
+  The order confirmation also changes to paid, and the order status history, notification, and chat timeline are recorded.
+#### Ordinary exceptional cases
+##### Another request for the same payment attempt
+- Return the existing order ID without creating a duplicate external capture, order, or completion notification.
+##### The capture result is still uncertain
+- Leave it as `NEEDS_CONFIRMATION` and check the session status again on the next request.
+##### Capture fails or the session expires
+- Mark the payment attempt as failed and do not create an order.
+##### The requester or session does not match
+- Reject the request immediately without proceeding with capture.
+#### Internal DB processing fails after external payment capture - `transaction failure`
+- The state where the external payment was captured but there is no internal order **must not remain unresolved**.
+- When the result is checked again and internal processing is completed, **only one** order should be created for that payment.
+#### Concurrent capture requests for the same payment attempt - `concurrent requests`
+- Even if two requests arrive almost simultaneously, the external capture request, order creation, completion notification, and timeline record must not be duplicated.
+- Both requests must ultimately be able to confirm the same payment result and order.
+
+---
+## Analyzing the Current Implementation
+### Controller
+```java
+@PostMapping("/payment-attempts/{paymentAttemptId}/capture")  
+public ApiResponse<PaymentCaptureResponse> capture(  
+    @PathVariable UUID paymentAttemptId,  
+    @Valid @RequestBody PaymentCaptureRequest request,  
+    @Authenticated CurrentUser currentUser) {  
+  RoleGuard.requireBuyer(currentUser);  
+  return ApiResponse.ok(  
+      PaymentCaptureResponse.from(paymentCaptureUseCase.capture(CapturePaymentCommand.of(  
+          paymentAttemptId, currentUser.userId(), request.sessionId(), request.payerId()))));  
+}
+```
+
+### UseCase Implementation
+```java
+  @Override
+  public PaymentCaptureResult capture(CapturePaymentCommand command) {
+	// Throw an exception if the payment session ID or payer ID is empty
+    validateCaptureMessage(command);
+
+	// Get the payment attempt
+    PaymentAttempt paymentAttempt = getPaymentAttempt(command.paymentAttemptId());
+
+	// Compare the buyer ID saved on the payment attempt with the requesting buyer ID
+    validateCaptureOwner(paymentAttempt, command.buyerUserId());
+	// Compare the session ID saved on the payment attempt with the requested session ID
+    validateSession(paymentAttempt, command.sessionId());
+    
+	// Check whether an order has already been created for this payment attempt
+	// Used to return the existing order ID on a repeat request
+    Optional<Order> existingOrder =
+        orderPersistencePort.findByPaymentAttemptId(paymentAttempt.getId());
+
+	// If the result of an earlier capture request is uncertain
+	// Query the existing payment session's status again with the payment provider to determine the result
+    if (paymentAttempt.needsConfirmation()) {
+      return reconcilePayment(paymentAttempt, command.payerId());
+    }
+
+	// If it is not READY, return the current result without sending another capture request
+    if (!paymentAttempt.isReady()) {
+      return PaymentCaptureResult.of(
+          paymentAttempt, existingOrder.map(Order::getId).orElse(null));
+    }
+
+	// If the payment attempt has expired, mark it as failed -> return the failure code
+    if (Instant.now(clock).isAfter(paymentAttempt.getExpiresAt())) {
+      paymentAttempt.fail("PAYMENT_SESSION_EXPIRED", Instant.now(clock));
+      return PaymentCaptureResult.of(paymentAttempt, null);
+    }
+	// Move the payment attempt to capture-in-progress and request capture from the payment provider
+    paymentAttempt.startCapture();
+    Point3CaptureResult captureResult = requestCapture(paymentAttempt.getPoint3SessionId());
+    
+	// Check the session ID returned by the payment provider, then reflect the capture result in the internal state
+    validatePoint3Session(paymentAttempt, captureResult);
+    return applyCaptureResult(paymentAttempt, command.payerId(), captureResult);
+  }
+```
+
+#### Follow-up Processing Based on the Payment Capture Result
+```java
+private PaymentCaptureResult applyCaptureResult(  
+    PaymentAttempt paymentAttempt, String payerId, Point3CaptureResult captureResult) {  
+    
+  // If the payment provider's result is CAPTURED (= the provider considers the payment complete), perform the follow-up processing for a completed payment
+  if (captureResult.status() == Point3CaptureResult.Status.CAPTURED) {  
+    return completePayment(paymentAttempt, payerId);  
+  }  
+   
+  Instant completedAt = Instant.now(clock);  
+  
+  // If the payment provider's result is a failure, change the payment attempt to FAILED and save the failure code
+  if (captureResult.status() == Point3CaptureResult.Status.FAILED) {  
+    paymentAttempt.fail(captureResult.failureCode(), completedAt);  
+  } else { // Otherwise (the payment is in progress), change the payment attempt to NEEDS_CONFIRMATION (the result needs checking)
+    paymentAttempt.needConfirmation(captureResult.failureCode(), completedAt);  
+  }  
+  
+  return PaymentCaptureResult.of(paymentAttempt, null);  
+}
+```
+
+```java
+private PaymentCaptureResult completePayment(PaymentAttempt paymentAttempt, String payerId) {  
+  Instant completedAt = Instant.now(clock);  
+  
+  OrderConfirmation confirmation = orderConfirmationPersistencePort  
+      .findById(paymentAttempt.getConfirmationId())  
+      .orElseThrow(  
+          () -> new BaseException(OrderConfirmationErrorCode.ORDER_CONFIRMATION_NOT_FOUND));  
+  
+  Inquiry inquiry = inquiryChatAccessService.getBuyerInquiry(  
+      confirmation.getInquiryId(), paymentAttempt.getPayerUserId());  
+  
+  User payer = userPersistencePort  
+      .findById(paymentAttempt.getPayerUserId())  
+      .orElseThrow(() -> new BaseException(CommonErrorCode.UNAUTHORIZED));  
+  
+  // Mark the payment as successful
+  paymentAttempt.succeed(payerId, completedAt);  
+  // Connect the payer ID issued by the payment provider
+  payer.connectPayer(payerId);
+  // Mark the order form confirmation as paid
+  confirmation.markPaid();  
+  // Change the inquiry status to paid only when this payment is for the order form submission in the current order consultation chat room's context
+  // If the chat room has already been marked paid or pickup is complete, return false and do not change the status
+  inquiry.markPaidIfCurrent(confirmation.getOrderFormSubmissionId());  
+  // A string snapshot of the IDs, sources, and other details of the order-start reference images attached to the inquiry, to keep with the order
+  String startReferenceAssets = orderStartReferenceAssetService.createOrderReferenceAssetSnapshot(  
+      confirmation.getInquiryId());  
+  // Create the order
+  Order order = orderPersistencePort  
+      .findByPaymentAttemptId(paymentAttempt.getId())  
+      .orElseGet(() -> orderPersistencePort.save(Order.create(  
+          inquiry.getStoreId(),  
+          paymentAttempt.getPayerUserId(),  
+          confirmation.getInquiryId(),  
+          confirmation.getId(),  
+          paymentAttempt.getId(),  
+          createOrderNumber(paymentAttempt),  
+          confirmation.getMenuName(),  
+          confirmation.getOptionSummary(),  
+          startReferenceAssets,  
+          paymentAttempt.getAmount(),  
+          confirmation.getPickupAt())));  
+  // Create the order's initial status history entry
+  orderStatusHistoryPersistencePort.save(OrderStatusHistory.create(  
+      order.getId(),  
+      null,  
+      order.getStatus(),  
+      paymentAttempt.getPayerUserId(),  
+      "PAYMENT_SUCCEEDED",  
+      completedAt));  
+  // After putting the snapshot on the order, delete the order-start reference image records temporarily linked to the inquiry
+  orderStartReferenceAssetService.clear(inquiry.getId());  
+  // Create payment completion notifications for both buyer and seller - deliver real-time notifications via SSE after the DB transaction
+  notifyPaymentCompleted(inquiry, order);  
+  // Publish the payment completion timeline item
+  chatTimelineItemPublisher.publishPaymentCompleted(  
+      inquiry.getId(), paymentAttempt.getPayerUserId(), order.getId());  
+  
+  return PaymentCaptureResult.of(paymentAttempt, order.getId());  
+}
+```
+
+---
+## Forming a Hypothesis to Test
+Initially, I thought I would improve transaction and concurrency handling throughout the payment capture process.
+After looking at the implementation, I think the internal DB operations, including changing the payment attempt's state, creating an order, and saving history and notifications, are already well structured to run within a single transaction.
+So I think the part to examine further is **the boundary between external payment capture and the internal DB transaction**.
+
+If internal DB processing fails after the external payment provider completes capture, the DB changes can be rolled back, but the external capture cannot be rolled back along with them. So next, I plan to test how external capture and order creation are handled when another request is made for the same payment attempt in that state.
+
+| Execution stage | Operation | What can be undone on failure |
+| --------- | ----------- | ------------------- |
+| Inside the DB transaction | Change the payment attempt's state | Subject to transaction rollback |
+| External payment provider | Request payment capture | Not subject to Wihada DB rollback |
+| Inside the DB transaction | Save the order, history, and notifications | Subject to transaction rollback |
