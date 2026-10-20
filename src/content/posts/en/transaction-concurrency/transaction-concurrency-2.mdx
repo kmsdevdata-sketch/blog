@@ -1,0 +1,302 @@
+---
+title: "Transactions and Concurrency, Part 2: Analyzing the Guarantees of the Payment Capture Flow"
+lang: en
+translationKey: transaction-concurrency-2
+pubDatetime: 2026-10-20T11:00:00+09:00
+category: "Spring"
+featured: false
+draft: false
+tags:
+  - Transaction
+  - Concurrency
+  - Payment
+  - Data Consistency
+  - Spring Boot
+description: "I examine how far atomicity, consistency, idempotency, and concurrency are guaranteed in the payment capture API through its code and DB constraints, then plan how to test a failure after external capture."
+---
+
+import GitHubRepoCard from "@/components/GitHubRepoCard.astro";
+
+This is Part 2 of my plan to improve an existing project to strengthen my portfolio and experience the transaction and concurrency process. [Wihada project](https://github.com/kmsdevdata-sketch/wihada-api)
+
+In the previous post, I selected the payment capture API to experience the process of analyzing and improving transaction and concurrency problems, and looked at the expected results in success and failure situations and the execution flow of the current code.
+
+In this post, I plan to go one step further and check **how far atomicity, consistency, idempotency, and concurrency are each guaranteed** based on the code and DB constraints.
+<GitHubRepoCard
+  repo="kmsdevdata-sketch/wihada-api"
+  title="Wihada API"
+  description="A backend service that manages consultation, ordering, and payment for custom cake shops in one flow"
+  previewImage="https://opengraph.githubassets.com/36f383c6d65701da09b0d3232d6d309021d2c7699d9e48818247aeaf6904a4a2/kmsdevdata-sketch/wihada-api"
+/>
+
+> [!info] Transactions and Concurrency Series
+>
+> **[Part 1 · Analyzing the Payment Capture Flow and Forming a Hypothesis to Test](/en/posts/transaction-concurrency/transaction-concurrency-1/)**
+>
+> **Part 2 · Analyzing the Guarantees of the Payment Capture Flow**
+
+> The testing and improvements in this post were carried out against the local application, not the deployed environment!
+
+---
+## Analyzing the Scope of the Guarantees
+### Atomicity
+> **Atomicity** means "the property of an operation being executed as one complete unit that cannot be divided further." In other words, the operation must "either succeed in its entirety or not be executed at all (All or Nothing)."
+
+I understand atomicity less as some **constraint** set by the developer and more as a property through which the DBMS guarantees that all operations within the transaction scope defined by the developer either succeed together or fail together.
+
+First, let's look at the scope currently guaranteed by the code.
+```java
+// After successful payment capture (CAPTURED) by the payment provider
+private PaymentCaptureResult completePayment(
+        PaymentAttempt paymentAttempt,
+        String payerId
+) {
+    // Entity lookup and validation omitted
+    Instant completedAt = Instant.now(clock);
+
+    // 1. Change payment and domain states
+    paymentAttempt.succeed(payerId, completedAt);  // Payment attempt → SUCCEEDED
+    payer.connectPayer(payerId);                    // Connect payment provider user ID
+    confirmation.markPaid();                        // Order confirmation → PAID
+    inquiry.markPaidIfCurrent(
+        confirmation.getOrderFormSubmissionId()
+    );                                              // Current inquiry → paid (conditionally)
+
+    // 2. Create order and initial status history
+    Order order = orderPersistencePort
+        .findByPaymentAttemptId(paymentAttempt.getId())
+        .orElseGet(() -> orderPersistencePort.save(
+            Order.create(/* Order information and reference image snapshot */)
+        ));
+
+    orderStatusHistoryPersistencePort.save(
+        OrderStatusHistory.create(/* Order status history */)
+    );
+
+    // 3. Clean up temporary data
+    orderStartReferenceAssetService.clear(inquiry.getId());
+
+    // 4. Publish payment completion notifications and chat timeline item
+    notifyPaymentCompleted(inquiry, order);
+    chatTimelineItemPublisher.publishPaymentCompleted(
+        inquiry.getId(),
+        paymentAttempt.getPayerUserId(),
+        order.getId()
+    );
+
+    return PaymentCaptureResult.of(paymentAttempt, order.getId());
+}
+```
+
+> If you need to check the actual codebase more precisely, it is included in the latter part of [Transactions and Concurrency, Part 1](/en/posts/transaction-concurrency/transaction-concurrency-1/)!
+#### Changes grouped when the transaction operates normally
+1. Mark the payment attempt as successful
+2. Connect the payment ID, which is an internal user attribute
+3. Mark the order confirmation as paid
+4. Change the current inquiry chat room's status to paid
+5. Create an order
+6. Create the order's initial status history
+7. Delete the chat room's order-start reference image records
+8. Create payment completion notifications for both buyer and seller
+9. Publish the payment completion timeline item
+
+As above, nine operations are performed.
+### Consistency
+> **Consistency** means the property of a system, data, or user interface (UI) operating without contradiction while maintaining certain rules and logic. From a data perspective, it means the DB must still satisfy all the rules defined by the system (constraints, triggers, etc.) after a transaction succeeds.
+
+First, we need to define what state the data must be in after payment completion to be valid. For now, let's check which conditions have already been established and where they are guaranteed.
+
+### Conditions to Meet
+1. **Payment requester matches**: The buyer on the payment attempt must be the same buyer who sent the capture request.
+2. **Payment target matches**: The external payment session to capture must be the session connected to that payment attempt.
+3. **Amounts match**: The amount captured externally, the payment attempt amount, and the payment amount of the created order must match.
+4. **Success states match**: If the external payment was captured, the internal payment attempt and order confirmation must also reflect the paid state, and a corresponding order must exist.
+5. **Failure states match**: If the external payment failed, a successful order must not be created.
+6. **Uncertain result stays pending**: If the external capture result cannot be checked, it must not be arbitrarily finalized as success or failure.
+7. **Prevent duplicate orders**: There must be at most one order corresponding to a payment attempt.
+8. **Prevent duplicate completion records**: The initial status history entry, completion notifications, and timeline items for the same completed payment must not be created more than once.
+9. **Accurate inquiry status**: The inquiry must change to paid only when the paid order form submission is the submission currently associated with that inquiry.
+10. **Recovery after failure**: If external capture succeeds but internal processing fails, the inconsistent state must not remain permanently; ultimately, the external payment result and internal order state must match.
+> Of course, all of the above conditions should be guaranteed reliably, but the main analysis and improvement focus established in the previous post is **“If external payment capture succeeds but internal DB processing fails, can a repeat request recover safely?”** So I think it would be good to focus on numbers 4, 7, 8, and 10.
+#### Guarantees Provided by DB Constraints
+> For readability and length, the SQL below excerpts only the parts related to these business rules from the constraints defined in the actual DB initialization script.
+##### Two orders must not be created for one payment attempt
+```sql
+CONSTRAINT uk_orders_payment_attempt_id
+	UNIQUE (payment_attempt_id)
+```
+##### An order must not reference a payment attempt that does not exist
+```sql
+CONSTRAINT fk_orders_payment_attempt_id
+    FOREIGN KEY (payment_attempt_id)
+    REFERENCES payment_attempts (id)
+```
+##### A payment attempt must not reference an order confirmation or buyer that does not exist
+```sql
+CONSTRAINT fk_payment_attempts_confirmation_id
+	FOREIGN KEY (confirmation_id)
+	REFERENCES order_confirmations (id),
+CONSTRAINT fk_payment_attempts_payer_user_id
+	FOREIGN KEY (payer_user_id)
+	REFERENCES users (id),
+```
+##### The same payment session ID must not be stored twice
+```sql
+CONSTRAINT uk_payment_attempts_point3_session_id
+	UNIQUE (point3_session_id)
+```
+##### The payment attempt amount must be valid
+```sql
+CONSTRAINT ck_payment_attempts_amount
+	CHECK (amount > 0)
+```
+After checking, only number 7 is directly guaranteed, and parts of numbers 2, 3, and 4 are guaranteed.
+#### Handling Found in the Code
+
+> The code below excerpts only the parts related to each condition in the payment capture flow.
+##### Matching the Payment Requester and Session
+```java
+validateCaptureOwner(paymentAttempt, command.buyerUserId());
+validateSession(paymentAttempt, command.sessionId());
+
+Point3CaptureResult captureResult =
+    requestCapture(paymentAttempt.getPoint3SessionId());
+validatePoint3Session(paymentAttempt, captureResult);
+```
+The buyer ID and session ID stored on the payment attempt are compared with the request values, and the session ID in the payment provider's response is also checked.
+##### Matching Amounts
+```java
+// During payment preparation
+if (session.amount() != confirmation.getAmount()) {
+  throw new BaseException(PaymentErrorCode.PAYMENT_EXTERNAL_UNAVAILABLE);
+}
+```
+
+At the **payment preparation stage**, the payment provider's session amount is compared with the order confirmation amount. The order is created using the amount stored on the payment attempt. But I found that there is no code to compare the amount in the capture result received by `capture()` again.
+
+##### Handling State According to the Payment Result
+```java
+if (captureResult.status() == Point3CaptureResult.Status.CAPTURED) {
+  return completePayment(paymentAttempt, payerId);
+}
+
+if (captureResult.status() == Point3CaptureResult.Status.FAILED) {
+  paymentAttempt.fail(captureResult.failureCode(), completedAt);
+} else {
+  paymentAttempt.needConfirmation(captureResult.failureCode(), completedAt);
+}
+```
+
+On successful capture, `completePayment()` changes the payment attempt and order confirmation states and creates the order. On failure, it changes to a failed state without creating an order; when the result is uncertain, it leaves the attempt in a state that requires confirmation.
+##### Preventing Duplicate Orders and Completion Records on Repeat Requests
+```java
+// If the payment attempt has already been handled, return the current result
+if (!paymentAttempt.isReady()) {
+  return PaymentCaptureResult.of(
+      paymentAttempt, existingOrder.map(Order::getId).orElse(null));
+}
+
+// If an order already exists during completion processing, reuse it
+Order order = orderPersistencePort
+    .findByPaymentAttemptId(paymentAttempt.getId())
+    .orElseGet(() -> orderPersistencePort.save(Order.create(/* ... */)));
+```
+
+If a repeat request arrives for a payment attempt already saved as `SUCCEEDED`, completion processing does not run again, and the existing order ID is returned. Therefore, in an **ordinary sequential repeat request**, the order and completion records are not created twice. However, if `completePayment()` is entered again, the existing order is reused, but the code below it still creates status history, notifications, and timeline items, so I found that prevention of duplicate completion records is not fully implemented.
+##### Protecting the Current Inquiry Status
+
+```java
+public boolean markPaidIfCurrent(UUID submissionId) {
+  if (!isCurrentSubmission(submissionId)
+      || status == InquiryStatus.PAID
+      || status == InquiryStatus.PICKED_UP) {
+    return false;
+  }
+
+  this.status = InquiryStatus.PAID;
+  return true;
+}
+```
+
+The inquiry status changes only when the paid order form submission is the current submission for that inquiry. An inquiry already paid or with pickup completed is not changed either.
+
+##### Recovery When Internal Processing Fails After External Capture
+
+```java
+if (paymentAttempt.needsConfirmation()) {
+  return reconcilePayment(paymentAttempt, command.payerId());
+}
+```
+
+If the `NEEDS_CONFIRMATION` state **has been saved** in the DB (the payment provider's success result is still unknown, so it needs to be checked again), there is a path that queries the payment provider session status on a repeat request. But if the transaction rolls back because internal DB processing fails after external capture, leaving the payment attempt as `READY`, this branch is not entered. **I cannot judge from the code alone whether this situation is handled, so I need to reproduce it.**
+
+To sum up, numbers 1, 2, 5, and 9 clearly have corresponding checks or branches in the code; for numbers 3, 4, 6, 7, and 8, **I need to distinguish the situations and scope in which they are guaranteed.** Number 10 is the key condition I will verify by actually reproducing the failure situation set up this time.
+
+### Idempotency
+> **Idempotency** means the property by which the final result of the server or system is exactly the same whether the same operation or request is executed once or repeated several times.
+
+First, the current application does not use a separate idempotency key for payment capture requests. Instead, it **separates payment preparation from payment capture**, and when capturing a payment, it handles repeat requests based on the ID and state of the payment attempt that has already been created. The handling for each state is as follows.
+
+1. **`NEEDS_CONFIRMATION`**: Since the result of the previous capture request is uncertain, query the status of the existing payment session instead of requesting capture again.
+2. **`SUCCEEDED`**: Since the payment has already completed, return the existing order ID without requesting capture again or creating a new order.
+3. **Any other state besides `READY`**: Return the current payment attempt state and existing order ID. If no order was created, the order ID is `null`.
+4. **`READY` but the session has expired**: Change the payment attempt to `FAILED` and return the expiration failure code.
+5. **Valid `READY` state**: Request capture from the payment provider and change the payment attempt's state according to the result.
+
+In this way, **repeat requests for a payment attempt whose result has already been saved** are handled by checking its state and returning the existing result, or by querying only an uncertain result again. But whether a repeat request can be handled safely in the same way when external capture succeeded but internal DB processing failed and the result was not saved needs to be verified separately.
+
+### Concurrency
+> **Concurrency** means the property of two or more operations proceeding during overlapping periods of time.
+
+As a brief aside, describing the concurrency problems mainly dealt with in backend work simply as "problems that occur when two or more operations proceed during overlapping periods of time," as I did above, is problematic. More precisely, I think they could be described as **"problems where concurrently running operations access shared state and produce an incorrect result depending on their execution order or timing."**
+
+That is because there is no problem at all just because many requests run at the same time. The problem does not come from concurrent execution itself; it mainly happens when multiple requests read the same data and try to make conflicting state changes based on it.
+
+#### Current Approach
+The current payment capture API uses a **pessimistic write lock** to control concurrent requests for the same payment attempt. We can see that `PESSIMISTIC_WRITE` is applied to the method that looks up the payment attempt.
+
+```java
+@Lock(LockModeType.PESSIMISTIC_WRITE)
+@Query("select paymentAttempt from PaymentAttempt paymentAttempt where paymentAttempt.id = :id")
+Optional<PaymentAttempt> findByIdForUpdate(@Param("id") UUID id);
+```
+
+The important point is **when the lock is acquired**. `capture()` first acquires the lock while looking up the payment attempt, then verifies the requester and session and branches according to the payment state.
+
+```java
+public PaymentCaptureResult capture(CapturePaymentCommand command) {
+  validateCaptureMessage(command);
+
+  // Lock and look up the payment attempt before checking its state
+  PaymentAttempt paymentAttempt = getPaymentAttempt(command.paymentAttemptId());
+
+  validateCaptureOwner(paymentAttempt, command.buyerUserId());
+  validateSession(paymentAttempt, command.sessionId());
+
+  // Look up the existing order and branch according to payment state
+  // ...
+}
+
+private PaymentAttempt getPaymentAttempt(UUID paymentAttemptId) {
+  return paymentAttemptPersistencePort
+      .findByIdForUpdate(paymentAttemptId)
+      .orElseThrow(() ->
+          new BaseException(PaymentErrorCode.PAYMENT_ATTEMPT_NOT_FOUND));
+}
+```
+
+If requests A and B arrive at the same time for the same payment attempt, A acquires the lock first and proceeds with payment processing, while B **waits at the payment attempt lookup**. If B acquires the lock after A's transaction commits, B reads the changed payment state. If A's payment completed as `SUCCEEDED`, B returns the existing order ID through the branch below without requesting external capture again.
+
+```java
+if (!paymentAttempt.isReady()) {
+  return PaymentCaptureResult.of(
+      paymentAttempt, existingOrder.map(Order::getId).orElse(null));
+}
+```
+
+But if A's transaction **rolls back**, B can read the previous `READY` state. Whether this flow is safe when external capture succeeds but internal DB processing fails needs to be verified separately.
+
+## Summary
+Having checked the scope of the guarantees, I plan to reproduce a situation in the next post where **capture requests from A and B arrive concurrently for the same payment attempt**. I will arrange for A to acquire the lock on the payment attempt and succeed in external payment capture, but fail during internal DB processing.
+
+After A's transaction rolls back, I plan to check what state remains in the DB and which branch the waiting B enters after acquiring the lock. In particular, I will look at whether another capture request is sent to the payment provider and how many final orders, history entries, and notifications are created. **After checking the actual result, I will decide what needs to be improved and verify before and after the change under the same conditions.**

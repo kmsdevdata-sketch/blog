@@ -1,0 +1,302 @@
+---
+title: "트랜잭션과 동시성 2편: 결제 승인 흐름의 보장 범위 분석"
+lang: ko
+translationKey: transaction-concurrency-2
+pubDatetime: 2026-10-20T11:00:00+09:00
+category: "Spring"
+featured: false
+draft: false
+tags:
+  - Transaction
+  - Concurrency
+  - Payment
+  - Data Consistency
+  - Spring Boot
+description: "결제 승인 API의 원자성·일관성·멱등성·동시성 보장 범위를 코드와 DB 제약조건으로 확인하고, 외부 승인 후 내부 처리 실패 상황을 검증할 계획을 세웁니다."
+---
+
+import GitHubRepoCard from "@/components/GitHubRepoCard.astro";
+
+이전 포트폴리오 강화 + 트랜잭션&동시성 프로세스를 경험하기 위한 기존 프로젝트를 개선 계획의 2편입니다. [위하다 프로젝트](https://github.com/kmsdevdata-sketch/wihada-api)
+
+지난 포스트에서는 트랜잭션 및 동시성 문제를 분석하고 개선하는 과정을 경험하기 위해 결제 승인 API를 선정하고, 성공·실패 상황의 기대 결과와 현재 코드의 실행 흐름을 살펴보았다.
+
+이번 포스트에서는 한 단계 더 들어가 코드와 DB 제약조건을 바탕으로 **원자성·일관성·멱등성·동시성이 각각 어디까지 보장되는지** 확인하려 한다. 
+<GitHubRepoCard
+  repo="kmsdevdata-sketch/wihada-api"
+  title="위하다 API"
+  description="주문제작 케이크 매장의 상담·주문·결제 과정을 하나의 흐름으로 관리하는 백엔드 서비스"
+  previewImage="https://opengraph.githubassets.com/36f383c6d65701da09b0d3232d6d309021d2c7699d9e48818247aeaf6904a4a2/kmsdevdata-sketch/wihada-api"
+/>
+
+> [!info] 트랜잭션과 동시성 시리즈
+>
+> **[1편 · 결제 승인 흐름 분석과 검증 가설](/posts/transaction-concurrency/transaction-concurrency-1/)**
+>
+> **2편 · 결제 승인 흐름의 보장 범위 분석**
+
+> 해당 포스트에서 테스트 및 개선은 배포환경이 아닌 로컬 어플리케이션 기준으로 실시되었습니다!
+
+---
+## 보장 범위 분석 
+### 원자성(Atomicity)
+> **원자성(Atomicity)**이란 "어떤 작업이 더 이상 쪼갤 수 없는 하나의 완전한 단위로 실행되는 성질"을 뜻합니다.즉 작업이 "전부 성공하거나,아예 실행되지 않아야(All or Nothing)"합니다.
+
+원자성은 개발자가 설정하는 어떠한 **제약조건** 이라기 보다는,개발자가 정의한 트랜잭션 범위 안의 작업을 DBMS가 전부 성공하거나 전부 실패하도록 보장하는 성질로 이해하고있다. 
+
+우선적으로 현재 코드에서 보장되는 범위를 살펴보자
+```java
+// 결제사 결제 승인 성공(CAPTURED) 이후
+private PaymentCaptureResult completePayment(
+        PaymentAttempt paymentAttempt,
+        String payerId
+) {
+    // 엔티티 조회 및 검증 과정 생략
+    Instant completedAt = Instant.now(clock);
+
+    // 1. 결제 및 도메인 상태 변경
+    paymentAttempt.succeed(payerId, completedAt);  // 결제 시도 → SUCCEEDED
+    payer.connectPayer(payerId);                    // 결제사 사용자 ID 연결
+    confirmation.markPaid();                        // 주문확인서 → PAID
+    inquiry.markPaidIfCurrent(
+        confirmation.getOrderFormSubmissionId()
+    );                                              // 현재 문의 → 결제 완료 (조건부)
+
+    // 2. 주문 및 최초 상태 이력 생성
+    Order order = orderPersistencePort
+        .findByPaymentAttemptId(paymentAttempt.getId())
+        .orElseGet(() -> orderPersistencePort.save(
+            Order.create(/* 주문 정보 및 참조 이미지 스냅샷 */)
+        ));
+
+    orderStatusHistoryPersistencePort.save(
+        OrderStatusHistory.create(/* 주문 상태 이력 */)
+    );
+
+    // 3. 임시 데이터 정리
+    orderStartReferenceAssetService.clear(inquiry.getId());
+
+    // 4. 결제 완료 알림 및 채팅 타임라인 발행
+    notifyPaymentCompleted(inquiry, order);
+    chatTimelineItemPublisher.publishPaymentCompleted(
+        inquiry.getId(),
+        paymentAttempt.getPayerUserId(),
+        order.getId()
+    );
+
+    return PaymentCaptureResult.of(paymentAttempt, order.getId());
+}
+```
+
+> 보다 정확한 코드베이스 확인이 필요할시 [트랜잭션과 동시성1편](https://www.beingbe.tech/posts/transaction-concurrency/transaction-concurrency-1/) 후반부에 기재되어 있습니다!
+#### 트랜잭션 정상 동작시에 변경 묶음 
+1. 결제시도  성공 처리 
+2. 유저 내부 속성인 결제ID 연결
+3. 주문 확인서 결제 완료 변경
+4. 현재 문의방 결제완료 상태로 변경 
+5. 주문 생성
+6. 주문의 최초 상태 이력 생성
+7. 채팅방 주문 시작 참조 이미지 기록 삭제  
+8. 구매자 판매자 양쪽에 결제 완료 알림 생성 
+9. 결제 완료 타임라인 아이템 발행 
+
+위와같이 9개의 동작이 수행된다.
+### 일관성(Consistency)
+> **일관성(Consistency)**이란 시스템,데이터,또는 사용자 인터페이스(UI)가 일정한 규칙과 논리를 유지하며 모순 없이 동작하는 성질을 의미하며 데이터 관점에서는 DB가 시스템이 정의한 모든 규칙(제약 조건,트레이거 등)을 트랜잭션 성공 후에도 충족해야 함을 뜻합니다.
+
+우선은 결제 완료 후 데이터가 어떤 상태여야 유효한가를 먼저 정의해야 한다.현재는 기존의 어떠한 조건이 정해졌고 어디서 보장되는지를 확인하여 보자.
+
+### 지켜야 할 조건 
+1. **결제 요청자 일치**: 결제 시도의 구매자와 승인 요청을 보낸 구매자가 같아야 한다.
+2. **결제 대상 일치**: 승인하려는 외부 결제 세션이 해당 결제 시도에 연결된 세션이어야 한다.
+3. **금액 일치**: 외부에서 승인된 금액, 결제 시도 금액, 생성된 주문의 결제 금액이 일치해야 한다.
+4. **성공 상태 일치**: 외부 결제가 승인됐다면 내부 결제 시도와 주문확인서도 결제 완료 상태로 반영되고, 대응하는 주문이 있어야 한다.
+5. **실패 상태 일치**: 외부 결제가 실패했다면 성공한 주문이 생성되어서는 안 된다.
+6. **불확실한 결과 보류**: 외부 승인 결과를 확인할 수 없다면 임의로 성공이나 실패로 확정해서는 안 된다.
+7. **주문 중복 방지**: 하나의 결제 시도에 대응하는 주문은 최대 한 건이어야 한다.
+8. **완료 기록 중복 방지**: 같은 결제 완료에 대한 최초 상태 이력·완료 알림·타임라인 항목이 중복 생성되어서는 안 된다.
+9. **문의 상태의 정확성**: 결제된 주문서 제출 건이 현재 문의의 제출 건일 때만 문의를 결제 완료 상태로 변경해야 한다.
+10. **실패 후 복구 가능성**: 외부 승인은 성공했지만 내부 처리가 실패했다면, 불일치 상태가 영구히 남지 않고 최종적으로 외부 결제 결과와 내부 주문 상태가 맞아야 한다.
+> 물론 위에 조건이 모두 안정적으로 보장되어야 하지만 이전 포스트에서 확정한 핵심 분석&개선 중점사항이 **“외부 결제 승인은 성공했는데 내부 DB 처리가 실패하면, 재요청으로 안전하게 복구되는가?”** 이기 떄문에 4,7,8,10 번을 중점적으로 확인해주시면 좋을듯합니다.
+#### DB 제약조건 보장
+> 가독성과 분량을 고려하여, 아래 SQL은 실제 DB 초기화 스크립트에 정의된 제약조건 중 해당 비즈니스 규칙과 관련된 부분만 발췌하였습니다.
+##### 한 결제 시도로 주문이 두 건 생기면 안 됨 
+```sql
+CONSTRAINT uk_orders_payment_attempt_id 
+	UNIQUE (payment_attempt_id)
+```
+##### 주문이 존재하지 않는 결제 시도를 참조하면 안 됨 
+```sql
+CONSTRAINT fk_orders_payment_attempt_id
+    FOREIGN KEY (payment_attempt_id)
+    REFERENCES payment_attempts (id)
+```
+##### 결제 시도가 존재하지 않는 주문확인서/구매자를 참조하면 안 됨 
+```sql
+CONSTRAINT fk_payment_attempts_confirmation_id 
+	FOREIGN KEY (confirmation_id) 
+	REFERENCES order_confirmations (id),  
+CONSTRAINT fk_payment_attempts_payer_user_id 
+	FOREIGN KEY (payer_user_id) 
+	REFERENCES users (id),
+```
+##### 같은 결제 세션 ID가 중복 저장되면 안 됨 
+```sql
+CONSTRAINT uk_payment_attempts_point3_session_id 
+	UNIQUE (point3_session_id)
+```
+##### 결제 시도 금액이 유효해야 함 
+```sql
+CONSTRAINT ck_payment_attempts_amount 
+	CHECK (amount > 0)
+```
+확인결과 7번만 직접적으로 보장되고 2,3,4번의 일부만 보장된다.
+#### 코드에서 확인되는 처리
+
+> 아래 코드는 결제 승인 흐름에서 각 조건과 관련된 부분만 발췌하였습니다.
+##### 결제 요청자와 세션 일치
+```java
+validateCaptureOwner(paymentAttempt, command.buyerUserId());
+validateSession(paymentAttempt, command.sessionId());
+
+Point3CaptureResult captureResult =
+    requestCapture(paymentAttempt.getPoint3SessionId());
+validatePoint3Session(paymentAttempt, captureResult);
+```
+결제 시도에 저장된 구매자 ID·세션 ID를 요청값과 비교하고, 결제사 응답의 세션 ID도 확인한다.
+##### 금액 일치
+```java
+// 결제 준비 과정
+if (session.amount() != confirmation.getAmount()) {
+  throw new BaseException(PaymentErrorCode.PAYMENT_EXTERNAL_UNAVAILABLE);
+}
+```
+
+결제 **준비 시점**에는 결제사 세션 금액과 주문확인서 금액을 비교한다. 주문은 결제 시도에 저장된 금액으로 생성된다. 하지만 `capture()`에서 받은 승인 결과의 금액을 다시 비교하는 코드는 구현되지 않은걸로 확인
+
+##### 결제 결과에 따른 상태 처리
+```java
+if (captureResult.status() == Point3CaptureResult.Status.CAPTURED) {
+  return completePayment(paymentAttempt, payerId);
+}
+
+if (captureResult.status() == Point3CaptureResult.Status.FAILED) {
+  paymentAttempt.fail(captureResult.failureCode(), completedAt);
+} else {
+  paymentAttempt.needConfirmation(captureResult.failureCode(), completedAt);
+}
+```
+
+승인 성공 시에는 `completePayment()`에서 결제 시도·주문확인서 상태를 변경하고 주문을 생성한다. 실패 시에는 주문 생성 없이 실패 상태로 변경하며, 결과가 불확실하면 확인이 필요한 상태로 둔다.
+##### 재요청 시 주문과 완료 기록 중복 방지
+```java
+// 이미 처리된 결제 시도라면 현재 결과 반환
+if (!paymentAttempt.isReady()) {
+  return PaymentCaptureResult.of(
+      paymentAttempt, existingOrder.map(Order::getId).orElse(null));
+}
+
+// 완료 처리 중 기존 주문이 있다면 재사용
+Order order = orderPersistencePort
+    .findByPaymentAttemptId(paymentAttempt.getId())
+    .orElseGet(() -> orderPersistencePort.save(Order.create(/* ... */)));
+```
+
+이미 `SUCCEEDED`가 저장된 결제 시도에 재요청하면 완료 처리를 다시 수행하지 않고 기존 주문 ID를 반환한다. 따라서 **일반적인 순차 재요청**에서는 주문·완료 기록이 중복 생성되지 않는다. 다만 `completePayment()`에 다시 진입하는 상황에서는 기존 주문을 재사용해도 그 아래의 상태 이력·알림·타임라인 생성 코드가 실행되므로 완료기록 중복방지가 완벽하게 실행되지는 않는걸로 확인
+##### 현재 문의 상태 보호
+
+```java
+public boolean markPaidIfCurrent(UUID submissionId) {
+  if (!isCurrentSubmission(submissionId)
+      || status == InquiryStatus.PAID
+      || status == InquiryStatus.PICKED_UP) {
+    return false;
+  }
+
+  this.status = InquiryStatus.PAID;
+  return true;
+}
+```
+
+결제된 주문서 제출 건이 현재 문의의 제출 건일 때만 문의 상태를 변경한다. 이미 결제 완료 또는 픽업 완료된 문의도 변경하지 않는다.
+
+##### 외부 승인 후 내부 처리 실패 시 복구
+
+```java
+if (paymentAttempt.needsConfirmation()) {
+  return reconcilePayment(paymentAttempt, command.payerId());
+}
+```
+
+DB에 `NEEDS_CONFIRMATION` 상태가(결제사 성공여부가 아직 미확인이여서 재확인 필요상태) **저장되어 있다면**, 재요청 시 결제사 세션 상태를 조회하는 경로가 있다. 그러나 외부 승인 후 내부 DB 처리 실패로 트랜잭션이 롤백되어 결제 시도가 `READY`로 남는 경우에는 이 분기로 들어가지 않는다. **이 상황이 어떻게 처리되는지는 아직 코드만으로 보장됐다고 판단할 수 없어 재현이 필요하다.**
+
+정리하면 1·2·5·9번은 해당 검사나 분기가 코드에 명확히 있고, 3·4·6·7·8번은 **보장되는 상황과 범위를 구분해야 한다.** 10번은 이번에 설정한 실패 상황을 실제로 재현해 확인할 핵심 조건이다.
+
+### 멱등성(Idempotency)
+> **멱등성(Idempotency)** 이란 동일한 연산이나 요청을 한 번 실행하든, 여러 번 반복해서 실행하든 서버나 시스템의 최종 결과가 완전히 같은 성질을 뜻합니다
+
+우선 현재 애플리케이션은 결제 승인 요청에 별도의 멱등성 키를 사용하지 않는다. 대신 **결제 준비와 결제 승인을 분리**하고, 결제 승인 시에는 이미 생성된 결제 시도의 ID와 상태를 기준으로 재요청을 처리한다. 상태별 처리 방식은 아래와 같다.
+
+1. **`NEEDS_CONFIRMATION`**: 이전 승인 요청의 결과가 불확실하므로, 승인을 다시 요청하지 않고 기존 결제 세션의 상태를 조회한다.
+2. **`SUCCEEDED`**: 이미 완료된 결제이므로 승인을 다시 요청하거나 주문을 새로 생성하지 않고, 기존 주문 ID를 반환한다.
+3. **그 외 `READY`가 아닌 상태**: 현재 결제 시도 상태와 기존 주문 ID를 반환한다. 생성된 주문이 없다면 주문 ID는 `null`이다.
+4. **`READY`이지만 세션이 만료된 상태**: 결제 시도를 `FAILED`로 변경하고 만료 실패 코드를 반환한다.
+5. **유효한 `READY` 상태**: 결제사에 승인을 요청하고, 결과에 따라 결제 시도의 상태를 변경한다.
+
+이처럼 **이미 처리 결과가 저장된 결제 시도의 재요청**은 상태를 확인해 기존 결과를 반환하거나, 불확실한 결과만 다시 조회하는 방식으로 처리한다. 다만 외부 승인은 성공했지만 내부 DB 처리가 실패해 결과가 저장되지 않은 경우에도 같은 방식으로 안전하게 재요청할 수 있는지는 별도로 검증해야 한다.
+
+### 동시성(Concurrency)
+> **동시성(Concurrency)** 이란 둘 이상의 작업이 시간적으로 겹치는 구간에 진행되는 성질을 의미한다.
+
+간략한 사담을 풀자면 백엔드에서 주로 다뤄지는 동시성 문제들은 위에 설명한 "둘 이상의 작업이 시간적으로 겹치는 구간에 진행되는 문제" 라고 적으면 문제가 있다.정확히는 **"동시 진행되는 작업들이 공유 상태에 접근하면서 실행 순서나 타이밍에 따라 잘못된 결과가 발생하는 문제"** 라고 할수있을것 같다.
+
+그러한 이유는 단순히 요청 다수가 동시에 실행된다고 해서 문제는 전혀 없기 때문이다.동시 실행 시점에 발생하는 문제가 아닌 다수의 요청이 동일한 데이터를 읽고 해당 데이터를 기준으로 서로 충돌하는 상태변경을 시도하려 할때 주로 발생이된다.
+
+#### 현재 사용중인 방식
+현재 결제 승인 API는 같은 결제 시도에 대한 동시 요청을 제어하기 위해 **비관적 쓰기 잠금**을 사용하고 있다. 결제 시도 조회 메서드에 `PESSIMISTIC_WRITE`가 적용된 것을 확인할 수 있다.
+
+```java
+@Lock(LockModeType.PESSIMISTIC_WRITE)
+@Query("select paymentAttempt from PaymentAttempt paymentAttempt where paymentAttempt.id = :id")
+Optional<PaymentAttempt> findByIdForUpdate(@Param("id") UUID id);
+```
+
+중요한 점은 **언제 잠금을 획득하느냐**이다. `capture()`는 결제 시도를 조회하는 단계에서 먼저 잠금을 획득한 뒤, 요청자·세션 검증과 결제 상태에 따른 분기를 수행한다.
+
+```java
+public PaymentCaptureResult capture(CapturePaymentCommand command) {
+  validateCaptureMessage(command);
+
+  // 상태 검사보다 먼저 결제 시도를 잠금 조회
+  PaymentAttempt paymentAttempt = getPaymentAttempt(command.paymentAttemptId());
+
+  validateCaptureOwner(paymentAttempt, command.buyerUserId());
+  validateSession(paymentAttempt, command.sessionId());
+
+  // 기존 주문 조회 및 결제 상태에 따른 분기
+  // ...
+}
+
+private PaymentAttempt getPaymentAttempt(UUID paymentAttemptId) {
+  return paymentAttemptPersistencePort
+      .findByIdForUpdate(paymentAttemptId)
+      .orElseThrow(() ->
+          new BaseException(PaymentErrorCode.PAYMENT_ATTEMPT_NOT_FOUND));
+}
+```
+
+같은 결제 시도에 A와 B의 요청이 동시에 들어오면, A가 먼저 잠금을 획득해 결제 처리를 진행하고 B는 **결제 시도 조회 지점에서 대기**한다. A의 트랜잭션이 커밋된 뒤 B가 잠금을 획득하면, B는 변경된 결제 상태를 읽는다. A의 결제가 `SUCCEEDED`로 완료됐다면 아래 분기에서 외부 승인을 다시 요청하지 않고 기존 주문 ID를 반환한다.
+
+```java
+if (!paymentAttempt.isReady()) {
+  return PaymentCaptureResult.of(
+      paymentAttempt, existingOrder.map(Order::getId).orElse(null));
+}
+```
+
+다만 A의 트랜잭션이 **롤백**되면 B는 변경 전 상태인 `READY`를 읽을 수 있다. 외부 승인은 성공했지만 내부 DB 처리가 실패한 경우에도 이 흐름이 안전한지는 별도로 검증해야 한다.
+
+## 정리 
+보장범위를 확인한 결론으로 다음 포스트에서는 **동일한 결제 시도에 A와 B의 승인 요청이 동시에 들어오는 상황**을 재현해보려 한다. A가 결제 시도의 잠금을 획득한 뒤 외부 결제 승인에는 성공하지만, 내부 DB 처리에서 실패하도록 설정한다.
+
+이후 A의 트랜잭션이 롤백됐을 때 DB에 어떤 상태가 남는지, 대기하던 B가 잠금을 획득한 뒤 어떤 분기로 들어가는지 확인할 예정이다. 특히 결제사 승인 요청이 다시 발생하는지와 최종 주문·이력·알림이 몇 건 생성되는지를 살펴보려 한다. **실제 결과를 확인한 뒤 개선이 필요한 부분을 결정하고, 변경 전후를 같은 조건으로 검증해보겠다.**

@@ -16,6 +16,7 @@ description: "I define the transaction and concurrency conditions to test for th
 ---
 
 import GitHubRepoCard from "@/components/GitHubRepoCard.astro";
+import ResponsiveTable from "@/components/ResponsiveTable.astro";
 
 After working on query optimization last time ([Query Optimization](/en/posts/query-optimization/query-optimization-1/)), I planned to take this opportunity to experience the process of improving transactions and concurrency as well. This time, too, I chose the Wihada project I had worked on before (a service that manages consultation, orders, and payments for custom cake shops in one flow) as the target project.
 
@@ -29,6 +30,8 @@ After working on query optimization last time ([Query Optimization](/en/posts/qu
 > [!info] Transactions and Concurrency Series
 >
 > **Part 1 · Analyzing the Payment Capture Flow and Forming a Hypothesis to Test**
+>
+> **[Part 2 · Analyzing the Guarantees of the Payment Capture Flow](/en/posts/transaction-concurrency/transaction-concurrency-2/)**
 
 > The testing and improvements in this post were carried out against the local application, not the deployed environment!
 
@@ -43,6 +46,8 @@ First, to choose candidates for analysis and improvement, I explored the APIs ba
 
 I used Codex to identify and classify the APIs, and the following API list came out of that process.
 
+<ResponsiveTable wide>
+
 | Candidate feature | API | What changes together across multiple pieces of data | When requests overlap for the same data |
 | --------------- | ----------------------------------------------------------- | --------------------------------------- | ----------------------------- |
 | **Payment capture** | `POST /payment-attempts/{paymentAttemptId}/capture` | The payment attempt, order confirmation, inquiry, order, status history, notifications, timeline, and more are connected | Duplicate capture requests arrive for the same payment attempt |
@@ -52,6 +57,8 @@ I used Codex to identify and classify the APIs, and the following API list came 
 | **Approving seller onboarding** | `PATCH /operator/seller-onboardings/{onboardingId}/approve` | The onboarding status changes and a store is created | The same application is approved concurrently, or approval and rejection requests overlap |
 | **Changing seller business hours** | `PUT /seller/stores/business-hours` | Settings for each day of the week are replaced, and the store's displayed business hours also change | Settings change requests overlap for the same store |
 | **Creating a store** | `POST /seller/stores` | A store and its default operating settings are created | Creation requests overlap for the same seller |
+
+</ResponsiveTable>
 
 There are about seven candidates, and I intend to pick just one of them for the analysis.
 When comparing the candidates, I focused on `business importance`, `data consistency`, `concurrency verification`, and `learning value`; in the end, I chose to analyze the `payment capture` feature. Here are the reasons I chose it.

@@ -1,6 +1,7 @@
 ---
 type Props = {
   class?: string;
+  wide?: boolean;
   variant?:
     /** No borders */
     | "minimal"
@@ -10,7 +11,7 @@ type Props = {
     | "striped-minimal";
 };
 
-const { class: className, variant } = Astro.props;
+const { class: className, variant, wide = false } = Astro.props;
 
 const variantClasses = {
   minimal: "[&_td]:border-0 [&_th]:border-0",
@@ -21,7 +22,8 @@ const variantClasses = {
 <div
   data-table-variant={variant}
   class:list={[
-    "overflow-hidden [&_table]:my-0 [&_table]:min-w-xl",
+    "overflow-hidden [&_table]:my-0",
+    wide ? "[&_table]:min-w-[56rem]" : "[&_table]:min-w-xl",
     variant === "minimal" && variantClasses.minimal,
     variant === "striped" && variantClasses.striped,
     variant === "striped-minimal" &&

@@ -16,6 +16,7 @@ description: "결제 승인 API의 트랜잭션·동시성 검증 조건을 정�
 ---
 
 import GitHubRepoCard from "@/components/GitHubRepoCard.astro";
+import ResponsiveTable from "@/components/ResponsiveTable.astro";
 
 지난번 쿼리 최적화 작업을 해보면서 ([쿼리 최적화](https://www.beingbe.tech/posts/query-optimization/query-optimization-1/)) 이참에 트랜잭션 및 동시성 개선 프로세스도 경험해보려 계획했다. 이번에도 대상 프로젝트는 이전에 진행했던 위하다 프로젝트(주문제작 케이크 매장의 상담·주문·결제를 한 흐름으로 관리하는 서비스)를 대상으로 선정했다.
 
@@ -29,6 +30,8 @@ import GitHubRepoCard from "@/components/GitHubRepoCard.astro";
 > [!info] 트랜잭션과 동시성 시리즈
 >
 > **1편 · 결제 승인 흐름 분석과 검증 가설**
+>
+> **[2편 · 결제 승인 흐름의 보장 범위 분석](/posts/transaction-concurrency/transaction-concurrency-2/)**
 
 > 해당 포스트에서 테스트 및 개선은 배포환경이 아닌 로컬 어플리케이션 기준으로 실시되었습니다!
 
@@ -43,6 +46,8 @@ import GitHubRepoCard from "@/components/GitHubRepoCard.astro";
 
 API목록 파악및 분류는 Codex를 사용하였고 아래와 같이 API목록이 추려졌다.
 
+<ResponsiveTable wide>
+
 | 후보 기능           | API                                                         | 여러 데이터가 함께 변경되는 부분                      | 같은 데이터에 요청이 겹치는 상황            |
 | --------------- | ----------------------------------------------------------- | --------------------------------------- | ----------------------------- |
 | **결제 승인**       | `POST /payment-attempts/{paymentAttemptId}/capture`         | 결제 시도·주문확인서·문의·주문·상태 이력·알림·타임라인 등이 연결됨  | 같은 결제 시도에 승인 요청이 중복 도착        |
@@ -52,6 +57,8 @@ API목록 파악및 분류는 Codex를 사용하였고 아래와 같이 API목�
 | **판매자 가입 승인**   | `PATCH /operator/seller-onboardings/{onboardingId}/approve` | 가입 상태 변경과 스토어 생성                        | 같은 신청을 동시에 승인하거나 승인·거절 요청이 겹침 |
 | **판매자 영업시간 변경** | `PUT /seller/stores/business-hours`                         | 요일별 설정을 교체하고 스토어의 영업시간 표시값도 변경          | 같은 스토어의 설정 변경 요청이 겹침          |
 | **스토어 생성**      | `POST /seller/stores`                                       | 스토어와 기본 운영 설정 생성                        | 같은 판매자의 생성 요청이 겹침             |
+
+</ResponsiveTable>
 
 약 7개의 후보군이 있는데 이중에서 분석후보는 한가지만 선택하여 진행하려 한다.
 후보선택의 비교군은 `비즈니스 중요도`,`데이터 정합성`,`동시성 검증`,`학습 가치`를 중점적으로 살폈으며,결론적으로 `결제 승인` 기능을 분석하기로 선택하였다. 해당 기능 선택한 이유는 아래와 같다.
