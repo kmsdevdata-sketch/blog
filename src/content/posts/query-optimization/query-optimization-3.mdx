@@ -270,6 +270,7 @@ Map<UUID, Long> unreadCountsByInquiryId = chatTimelineItemPort.countUnread(
 |평균: 변경 전 → 후|302.90 → 102.81ms|255.51 → 76.97ms|267.35 → 69.38ms|
 |평균 응답 속도|약 **2.9배**|약 **3.3배**|약 **3.9배**|
 |p95: 변경 전 → 후|336.84 → 119.62ms|328.44 → 106.67ms|384.94 → 91.96ms|
+
 평균 응답 시간 기준 약 2.9~3.9배 빨라진 놀라운 성과를 보였다!🎉
 
 ### SQL 실행 횟수 및 DB 실행 시간 재측정
@@ -289,6 +290,7 @@ Map<UUID, Long> unreadCountsByInquiryId = chatTimelineItemPort.countUnread(
 | 일괄 조회 SQL 호출 횟수     | 1회      | 1,002개 문의의 읽지 않은 항목 수를 한 번에 집계 |
 | DB 누적 실행 시간         | 2.602ms | 해당 SQL 1회의 **DB 내부 실행 시간**     |
 | 문의별 개별 조회 SQL 호출 횟수 | 0회      | 기존 반복 조회가 사라짐                  |
+
 기존 반복 조회가 사라진것과 더불어 DB누적 실행시간이 약 2.5배 개선되었다🎉
 
 ## 직접 분석후 개선해보며 느낀 점
