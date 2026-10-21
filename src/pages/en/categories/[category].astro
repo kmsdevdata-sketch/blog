@@ -2,7 +2,7 @@
 import CategoryPage from "@/pages/categories/[category].astro";
 
 export function getStaticPaths() {
-  return ["java", "spring", "cs", "db"].map(category => ({
+  return ["java", "spring", "cs", "db", "infra"].map(category => ({
     params: { category },
   }));
 }

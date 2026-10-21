@@ -12,7 +12,7 @@ import config from "@/config";
 type Props = Record<string, never>;
 
 export function getStaticPaths() {
-  return ["java", "spring", "cs", "db"].map(category => ({
+  return ["java", "spring", "cs", "db", "infra"].map(category => ({
     params: { category },
   }));
 }
@@ -24,6 +24,7 @@ const categoryMap: Record<string, string> = {
   spring: "Spring",
   cs: "CS",
   db: "DB",
+  infra: "Infra",
 };
 
 const categoryName = categoryMap[categorySlug ?? ""];

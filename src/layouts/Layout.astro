@@ -31,7 +31,7 @@ const {
 const locale = Astro.currentLocale ?? site.lang;
 const logicalPath = stripLocale(stripBase(Astro.url.pathname), locale);
 const hasStaticTranslation =
-  /^\/(?:about|archives|categories(?:\/(?:java|spring|cs|db))?|posts|search|tags)?\/?$/.test(
+  /^\/(?:about|archives|categories(?:\/(?:java|spring|cs|db|infra))?|posts|search|tags)?\/?$/.test(
     logicalPath
   );
 const alternates =
