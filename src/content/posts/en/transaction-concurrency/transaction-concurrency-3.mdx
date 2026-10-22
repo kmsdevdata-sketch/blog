@@ -1,0 +1,346 @@
+---
+title: "Transactions and Concurrency, Part 3: Reproducing Concurrent Payment Capture and Recovering from Failure"
+lang: en
+translationKey: transaction-concurrency-3
+pubDatetime: 2026-10-23T02:20:00+09:00
+category: "Spring"
+featured: false
+draft: false
+tags:
+  - Transaction
+  - Concurrency
+  - Payment
+  - Data Consistency
+  - Spring Boot
+description: "I reproduce concurrent capture requests for the same payment attempt, analyze an internal DB failure after external capture, and verify recovery through provider status checks and a recovery job."
+---
+
+import GitHubRepoCard from "@/components/GitHubRepoCard.astro";
+import ResponsiveTable from "@/components/ResponsiveTable.astro";
+
+This is Part 3 of my plan to improve an existing project to strengthen my portfolio and experience the transaction and concurrency process. [Wihada project](https://github.com/kmsdevdata-sketch/wihada-api)
+
+[
+
+](https://github.com/kmsdevdata-sketch/wihada-api)
+
+In the previous post, I checked **how far atomicity, consistency, idempotency, and concurrency are each guaranteed** based on the code and DB constraints. In this post, I plan to reproduce the test scenario chosen in the previous post, **A and B sending capture requests for the same payment attempt at the same time**, check the results before improvement, and, if I find a problem, identify its cause and verify the results again after improving it.
+<GitHubRepoCard
+  repo="kmsdevdata-sketch/wihada-api"
+  title="Wihada API"
+  description="A backend service that manages consultation, ordering, and payment for custom cake shops in one flow"
+  previewImage="https://opengraph.githubassets.com/36f383c6d65701da09b0d3232d6d309021d2c7699d9e48818247aeaf6904a4a2/kmsdevdata-sketch/wihada-api"
+/>
+
+> [!info] Transactions and Concurrency Series
+>
+> **[Part 1 · Analyzing the Payment Capture Flow and Forming a Hypothesis to Test](/en/posts/transaction-concurrency/transaction-concurrency-1/)**
+>
+> **[Part 2 · Analyzing the Guarantees of the Payment Capture Flow](/en/posts/transaction-concurrency/transaction-concurrency-2/)**
+>
+> **Part 3 · Reproducing Concurrent Payment Capture and Recovering from Failure**
+
+> The testing and improvements in this post were carried out against the local application, not the deployed environment!
+
+---
+## Defining the Test Conditions
+
+I wrote this in the header as well, but first, let's define the test conditions and what to check precisely once more.
+
+The test I will run is a situation where **A and B send capture requests for the same payment attempt at the same time**.
+More specifically, I will set things up so that A acquires the lock on the payment attempt and succeeds in the external payment capture, but fails during internal DB processing.
+
+ 1. What state remains in the DB when the transaction rolls back
+ 2. Which branch the waiting B enters after acquiring the lock
+ 3. In particular, whether the payment provider receives another capture request, and how many final orders, histories, and notifications are created
+
+### Test Environment
+
+The test runs under the `test` profile, using **Testcontainers PostgreSQL** to check actual DB behavior.
+#### Payment Provider Fake
+
+The existing payment integration tests have a `FakePaymentPort` that works in place of the real payment provider. I can use it to set the provider response to `CAPTURED` and check the number of capture requests and the execution order of the two requests.
+
+In this test, I will use that fake to create a situation where **external payment capture succeeds**, then cause a failure during internal DB processing and check the final results of requests A and B. No requests are sent to the real payment provider.
+## Checking the Results Before Improvement
+### Test Code Structure
+```java
+@Test
+@Transactional(propagation = Propagation.NOT_SUPPORTED)
+@DisplayName("Check the behavior of concurrent capture requests when internal processing fails after external capture")
+void retriesCaptureAfterConcurrentInternalRollback() throws Exception {
+  // Prepare the order form, confirmation, and payment attempt needed for capture.
+  Fixture fixture = prepareFixture("payment-capture-rollback");
+  sellerOrderFormSubmissionViewUseCase.markViewed(
+      fixture.inquiry().getId(),
+      fixture.submission().getId(),
+      fixture.store().id());
+
+  SendOrderConfirmationResult confirmation = sendConfirmation(fixture);
+  orderConfirmationStateService.markBuyerViewed(
+      fixture.inquiry().getId(),
+      confirmation.orderConfirmation().id(),
+      fixture.buyer().getId());
+
+  PaymentPreparationResult prepared = paymentPrepareUseCase.prepare(
+      PreparePaymentCommand.of(
+          fixture.inquiry().getId(),
+          confirmation.orderConfirmation().id(),
+          fixture.buyer().getId()));
+
+  // After external capture succeeds, make only request A fail when saving internal status history.
+  AtomicBoolean failOnce = new AtomicBoolean(true);
+  doAnswer(invocation -> {
+    if (failOnce.compareAndSet(true, false)) {
+      throw new IllegalStateException("simulated failure after external capture");
+    }
+    return invocation.callRealMethod();
+  }).when(orderStatusHistoryPersistencePort).save(any());
+
+  paymentProviderFake.blockCapture();
+  ExecutorService executorService = Executors.newFixedThreadPool(2);
+  CountDownLatch secondCaptureStarted = new CountDownLatch(1);
+
+  try {
+    Future<PaymentCaptureResult> first = executorService.submit(() ->
+        paymentCaptureUseCase.capture(CapturePaymentCommand.of(
+            prepared.paymentAttemptId(),
+            fixture.buyer().getId(),
+            prepared.sessionId(),
+            "payer-new")));
+
+    // Start B after A reaches the payment provider capture call and stops there.
+    assertTrue(paymentProviderFake.awaitCaptureStarted());
+
+    Future<PaymentCaptureResult> second = executorService.submit(() -> {
+      secondCaptureStarted.countDown();
+      return paymentCaptureUseCase.capture(CapturePaymentCommand.of(
+          prepared.paymentAttemptId(),
+          fixture.buyer().getId(),
+          prepared.sessionId(),
+          "payer-new"));
+    });
+
+    assertTrue(secondCaptureStarted.await(5, TimeUnit.SECONDS));
+    assertFalse(second.isDone());
+
+    paymentProviderFake.releaseCapture();
+
+    // A's internal DB processing fails.
+    ExecutionException firstFailure =
+        assertThrows(ExecutionException.class,
+            () -> first.get(10, TimeUnit.SECONDS));
+    assertEquals(
+        "simulated failure after external capture",
+        firstFailure.getCause().getMessage());
+
+    // Check B's result and the final persisted state.
+    PaymentCaptureResult secondResult = second.get(10, TimeUnit.SECONDS);
+    Order order = orderJpaRepository
+        .findByPaymentAttemptId(prepared.paymentAttemptId())
+        .orElseThrow();
+
+    assertEquals(2, paymentProviderFake.captureCount());
+    assertEquals(PaymentAttemptStatus.SUCCEEDED, secondResult.status());
+    assertEquals(
+        PaymentAttemptStatus.SUCCEEDED,
+        paymentAttemptJpaRepository
+            .findById(prepared.paymentAttemptId())
+            .orElseThrow()
+            .getStatus());
+    assertEquals(order.getId(), secondResult.orderId());
+    assertEquals(
+        1,
+        orderJpaRepository
+            .findAllByBuyerUserIdOrderByCreatedAtDesc(fixture.buyer().getId())
+            .size());
+    assertEquals(
+        1,
+        orderStatusHistoryPersistencePort.findAllByOrderId(order.getId()).size());
+    assertEquals(1, paymentCompletedNotificationCount(fixture.buyer().getId()));
+    assertEquals(1, paymentCompletedNotificationCount(fixture.seller().getId()));
+    assertEquals(
+        1,
+        paymentCompletedTimelineCount(fixture.inquiry().getId(), order.getId()));
+  } finally {
+    paymentProviderFake.releaseCapture();
+    executorService.shutdownNow();
+  }
+}
+```
+
+### Test Results
+
+<ResponsiveTable wide>
+
+| Log | Meaning |
+| --- | --- |
+| `[Test worker] insert into payment_attempts` | Create the payment attempt during test setup |
+| `[pool-7-thread-1] select ... from payment_attempts ... for no key update` | A requests a write lock on the payment attempt |
+| `[pool-7-thread-2] select ... from payment_attempts ... for no key update` | B also requests the lock on the same payment attempt |
+| `[pool-7-thread-1] select ... from order_confirmations / inquiries / users / order_start_reference_assets / orders` | A reads the internal data needed to complete the payment |
+| `[pool-7-thread-2] select ... from orders`, etc. | B's internal processing proceeds after A's injected exception. **The exception itself is not shown in this SQL log** |
+| `[pool-7-thread-2] insert into orders / order_status_histories / notifications / chat_timeline_items`, `update payment_attempts`, etc. | B saves the order and completion records and updates related states |
+| `[Test worker] select ... from orders / payment_attempts / order_status_histories / notifications / chat_timeline_items` | The test reads the final DB state and verifies it |
+
+</ResponsiveTable>
+
+After A's external capture result came back as `CAPTURED`, its internal processing failed, so none of A's DB changes remained. B then called the external capture API again for the same payment attempt. In the final DB, the order and completion records were each saved only once.
+
+Comparing this with the points I decided to check in the test:
+ 1. What state remains in the DB when the transaction rolls back  
+	The fake provider response was `CAPTURED`, but the payment attempt in the DB remained in its previous `READY` state. The order, history, and notifications processed by A did not remain in the DB either.
+ 2. Which branch the waiting B enters after acquiring the lock  
+	B read the `READY` state and entered the **new capture request branch**, rather than the `NEEDS_CONFIRMATION` branch. So it called the provider's `capture()` after `startCapture()`.
+ 3. In particular, whether another provider capture request occurs and how many final orders, histories, and notifications are created
+	The fake provider's `capture()` was called **twice in total (once by A and once by B)**. After B finished, the DB contained **one order, one status history, one buyer completion notification, one seller completion notification, and one completion timeline entry**, and the payment attempt was `SUCCEEDED`.
+## Deciding Whether to Improve It
+
+In the test, A's internal transaction rolled back properly, but the provider's capture result cannot be rolled back with it.
+As a result, the internal payment attempt remained `READY`, and the waiting B asked the payment provider to capture it again.  
+**Whether that second call actually leads to a duplicate charge depends on the provider's policy for recapturing the same session.** I cannot conclude the result just because the same session is used.  
+Even if the provider supports idempotency and prevents a duplicate charge, **if only A makes a request and internal processing fails, the external payment can be captured while there is no internal order**. 
+So the key to deciding how to improve this is whether I can check and recover that state without another request.
+
+### Approaches to Improvement
+<ResponsiveTable wide>
+
+| Approach | What it does when the external operation succeeds but internal processing fails |
+| --- | --- |
+| **1. Retry internal processing** | **Check the status of the existing session** with the payment provider. If it has already been captured, complete the failed internal processing, such as creating the order, without capturing the payment again. |
+| **2. Compensate for the external operation** | If internal processing cannot be completed, cancel or refund the already captured payment so that both sides end in a failed state. Unlike a DB rollback, a refund is **a new external operation**, so its failure must also be handled. |
+| **3. Record recovery targets and check them in the background** | Save the payment attempt and session ID in the DB before the external call. Even if processing stops later, a worker can check the provider status for unfinished attempts and perform step 1 or 2. This is **a way to recover even without another user request**. |
+| **4. Use provider idempotency** | Keep using an idempotency key or similar mechanism supported by the provider for the same payment attempt, so retrying a capture request does not duplicate its external effect. However, this alone **does not recover an internal order missing after capture**. |
+| **5. Receive provider events** | Receive the provider's capture-completed event, check internal state, and perform any missing processing. Internal processing must be idempotent even if events are duplicated or delayed, and a status check can also be used in case an event is missed. |
+| **6. Transactional outbox** | If the direction is **changing our DB first and sending an external message afterward**, save the DB changes and the message to send in one transaction and have a separate worker send it. But an outbox alone **does not solve a case like this one, where the provider has already captured the payment and our DB then fails**. |
+
+</ResponsiveTable>
+
+I judged that applying approaches 1 and 3 together fits the current project. 
+That is because the payment attempt and external session ID are saved in the DB before the capture request, and the existing implementation already has logic for checking session status and completing the payment. Therefore, even if internal processing fails, I can check whether that session was actually captured and then retry creating the order for a captured payment.
+
+However, if retries depend only on a buyer's request, then when nobody calls again after A's request, the external payment remains captured with no internal order. Periodically checking unfinished payment attempts would let the system find that state and try to recover it without another user request.
+## Verifying Again After Improvement
+### Main Improvements Needed
+1. Transaction boundary of the payment capture feature: Commit a state meaning **"capture in progress"** in a separate transaction before the external call, leaving a clue for recovery.
+2. Path to complete processing after checking provider status: Previously, the system checked the provider's session status only for the **"confirmation needed"** state, but it should also check the session status for payment attempts in **"capture in progress"** after internal processing fails.
+3. Recovery job to find unfinished attempts and recheck payments: A job is needed to find payment attempts that have remained in **"capture in progress"** or similar states for too long and run the path in step 2, so the result is reflected even without another request.
+
+### Changes
+#### Separating the External Capture Call from the DB Transaction
+```java
+// Before
+@Transactional // Entire PaymentService class
+public class PaymentService {
+  public PaymentCaptureResult capture(CapturePaymentCommand command) {
+    PaymentAttempt paymentAttempt = getPaymentAttempt(command.paymentAttemptId());
+    paymentAttempt.startCapture();
+    Point3CaptureResult result = requestCapture(paymentAttempt.getPoint3SessionId());
+    return applyCaptureResult(paymentAttempt, command.payerId(), result);
+  }
+}
+
+// ======================================================================
+
+// After
+public PaymentCaptureResult capture(CapturePaymentCommand command) {
+  validateCaptureMessage(command);
+
+  // First, commit IN_PROGRESS to the DB.
+  CaptureStep step = transaction(() -> beginCapture(command));
+  if (step.action() == CaptureAction.RETURN) {
+    return step.result();
+  }
+
+  // Call the payment provider outside the DB transaction.
+  Point3CaptureResult providerResult = step.action() == CaptureAction.CAPTURE
+      ? requestCapture(step.sessionId())
+      : requestSession(step.sessionId());
+
+  // Process the provider result and create the order in a separate transaction.
+  return transaction(
+      () -> applyProviderResult(command.paymentAttemptId(), command.payerId(), providerResult));
+}
+```
+
+> `transaction()` uses Spring's transaction management interface, `PlatformTransactionManager`, by passing it to `TransactionTemplate`. `TransactionTemplate.execute()` runs the supplied operation inside a transaction, commits if it finishes normally, and rolls back if an exception occurs. Here, I configured `REQUIRES_NEW` so that each call runs its operation in a separate transaction..
+
+Even if the first request's internal processing rolls back, the previously committed `IN_PROGRESS` remains => This keeps the waiting second request from treating the attempt as `READY` and calling capture again.
+
+#### Saving the Information Needed for Recovery
+```java
+// Before
+public void startCapture() {
+  this.status = PaymentAttemptStatus.IN_PROGRESS;
+}
+
+// After
+public void startCapture(String payerId, Instant startedAt) {
+  this.payerId = Objects.requireNonNull(payerId, "payerId");
+  this.captureStartedAt = Objects.requireNonNull(startedAt, "startedAt");
+  this.status = PaymentAttemptStatus.IN_PROGRESS;
+  this.failureCode = null;
+}
+```
+
+I save the capture start time and payer ID so that the recovery job can process the payment even after the original request fails.
+
+#### Recovering Payments That Have Been Stuck for Too Long
+```java
+@Scheduled(fixedDelay = 60_000)
+public void reconcileStalePayments() {
+  Instant cutoff = Instant.now(clock).minus(RECOVERY_DELAY);
+
+  for (UUID paymentAttemptId :
+      paymentAttemptPersistencePort.findRecoverableIdsBefore(cutoff, 100)) {
+    try {
+      recoverPayment(paymentAttemptId);
+    } catch (Exception e) {
+      log.error("Payment recovery failed. paymentAttemptId={}", paymentAttemptId, e);
+    }
+  }
+}
+```
+
+> With `@Scheduled`, Spring's scheduler calls the method repeatedly; `fixedDelay = 60_000` means it runs again 60 seconds after the previous execution finishes.
+
+#### DB Columns
+```SQL
+ALTER TABLE payment_attempts
+    ADD COLUMN capture_started_at TIMESTAMPTZ,
+    ADD COLUMN reconciliation_checked_at TIMESTAMPTZ;
+```
+`capture_started_at`: The time when the capture request begins and the status changes to `IN_PROGRESS`.
+`reconciliation_checked_at`: The time when the recovery target was last checked.
+
+### Verifying the Results After Improvement
+
+<ResponsiveTable wide>
+
+| Log | Meaning |
+| --- | --- |
+| `[Test worker] insert into payment_attempts` | Create the payment attempt during test setup |
+| `[pool-7-thread-1] select ... for no key update` → `update payment_attempts` | A locks the payment attempt and changes it to `IN_PROGRESS` |
+| `[pool-7-thread-2] select ... for no key update` | B also requests a write lock on the same payment attempt |
+| `[pool-7-thread-1] select ... payment_attempts / order_confirmations / inquiries / users / orders` | A processes internal completion after receiving the provider response. The injected exception then rolls back the DB changes from this processing |
+| `[pool-7-thread-2] select ... from orders` | B enters the branch for an `IN_PROGRESS` attempt, checks whether an existing order exists, and returns a result. **There is no order creation SQL from B** |
+| `[Test worker] select ... payment_attempts / orders` | The test verifies the payment attempt's state and the absence of an order after A fails |
+| `[Test worker] update capture_started_at` → `select ... payment_attempts` | The test moves the capture start time into the past to make the attempt eligible for recovery, then the recovery job queries for targets |
+| `[Test worker] select ... for no key update` and internal data reads | The recovery job locks the payment attempt again and starts completion processing based on the provider session result |
+| `[Test worker] insert into orders / order_status_histories / notifications / chat_timeline_items`, `update payment_attempts`, etc. | **The recovery job** creates the order and completion records and updates the payment attempt, order confirmation, and inquiry states |
+| `[Test worker] select ... orders / payment_attempts / order_status_histories / notifications / chat_timeline_items` | The test reads and verifies the final persisted results |
+
+</ResponsiveTable>
+
+A and B sent capture requests for the same payment attempt at the same time. A changed the payment attempt to `IN_PROGRESS` and then proceeded with external capture, but the injected exception during internal order processing rolled back only that processing. 
+B saw the `IN_PROGRESS` state and returned the current result; it neither asked the provider to capture the payment again nor created an order.
+
+The recovery job then **checked the status of the existing payment session**. After confirming the provider's `CAPTURED` result, it created the order, status history, completion notifications, and chat timeline entry, and changed the payment attempt to `SUCCEEDED`.
+
+In the test, I confirmed **one** call to the provider's `capture()`, **one** session status lookup, and that the final order and completion records were each created without duplicates. 
+The SQL logs show the flow of DB reads and changes, but they do not directly show the external provider calls or the result of the rollback, so I based those two findings on the test's call counts and final state checks.
+
+## What I Felt After Analyzing and Improving It Myself
+Until now, I had rarely analyzed the possibility of transaction and concurrency problems in depth. This time, it was meaningful to check how atomicity, consistency, idempotency, and concurrency are each guaranteed for one payment feature and to reproduce a situation where external payment capture succeeds but internal processing fails.
+
+Of course, I still need to keep learning the details of DB locks and transactions. Still, this experience has made me think first about **which state needs to be committed to the DB ahead of time, where to place the boundary between external calls and transactions, and what results remain when failures overlap with concurrent requests** when designing features in the future. I also learned the process of defining a scenario, reproducing it, and verifying the results instead of stopping at vague guesses about the possibility of a problem.

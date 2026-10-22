@@ -1,0 +1,346 @@
+---
+title: "트랜잭션과 동시성 3편: 동시 결제 승인 재현과 실패 복구"
+lang: ko
+translationKey: transaction-concurrency-3
+pubDatetime: 2026-10-23T02:20:00+09:00
+category: "Spring"
+featured: false
+draft: false
+tags:
+  - Transaction
+  - Concurrency
+  - Payment
+  - Data Consistency
+  - Spring Boot
+description: "동일 결제 시도에 대한 동시 승인 요청을 재현하고, 외부 승인 후 내부 DB 처리 실패 문제를 분석해 결제 상태 조회와 복구 작업으로 재검증합니다."
+---
+
+import GitHubRepoCard from "@/components/GitHubRepoCard.astro";
+import ResponsiveTable from "@/components/ResponsiveTable.astro";
+
+이전 포트폴리오 강화 + 트랜잭션&동시성 프로세스를 경험하기 위한 기존 프로젝트를 개선 계획의 3편입니다. [위하다 프로젝트](https://github.com/kmsdevdata-sketch/wihada-api)
+
+[
+
+](https://github.com/kmsdevdata-sketch/wihada-api)
+
+지난 포스트에서는 코드와 DB 제약조건을 바탕으로 **원자성·일관성·멱등성·동시성이 각각 어디까지 보장되는지** 확인해보았다. 이번 포스트에서는 앞선 포스트에서 정한 테스트 주제로 선정한 **동일한 결제 시도에 A와 B의 승인 요청이 동시에 들어오는 상황**을 재현해보고 개선 전 결과를 확인 -> 문제가 포착된다면 원인 파악과 개선 후 재검증 까지 할 예정이다.
+<GitHubRepoCard
+  repo="kmsdevdata-sketch/wihada-api"
+  title="위하다 API"
+  description="주문제작 케이크 매장의 상담·주문·결제 과정을 하나의 흐름으로 관리하는 백엔드 서비스"
+  previewImage="https://opengraph.githubassets.com/36f383c6d65701da09b0d3232d6d309021d2c7699d9e48818247aeaf6904a4a2/kmsdevdata-sketch/wihada-api"
+/>
+
+> [!info] 트랜잭션과 동시성 시리즈
+>
+> **[1편 · 결제 승인 흐름 분석과 검증 가설](/posts/transaction-concurrency/transaction-concurrency-1/)**
+>
+> **[2편 · 결제 승인 흐름의 보장 범위 분석](/posts/transaction-concurrency/transaction-concurrency-2/)**
+>
+> **3편 · 동시 결제 승인 재현과 실패 복구**
+
+> 해당 포스트에서 테스트 및 개선은 배포환경이 아닌 로컬 어플리케이션 기준으로 실시되었습니다!
+
+---
+## 테스트 조건 정의
+
+우선 헤더에도 적어두었지만 다시한번 테스트 조건과 확인할 부분을 정확하게 정의해보자.
+
+이번에 할 테스트는 **동일한 결제 시도에 A와 B의 승인 요청이 동시에 들어오는 상황** 을 테스트할 예정이고
+조금더 자세히는 A가 결제 시도의 잠금을 획득한 뒤 외부 결제 승인에는 성공하지만, 내부 DB 처리에서 실패하도록 설정할것이다.
+
+ 1. 트랜잭션이 롤백됐을 때 DB에 어떤 상태가 남는지
+ 2. 대기하던 B가 잠금을 획득한 뒤 어떤 분기로 들어가는지 확인 
+ 3. 특히 결제사 승인 요청이 다시 발생하는지와 최종 주문·이력·알림이 몇 건 생성되는지 확인
+
+### 테스트 환경
+
+테스트는 `test` 프로필에서 실행하며, 실제 DB 동작을 확인하기 위해 **Testcontainers PostgreSQL**을 사용한다.
+#### 결제사 대역
+
+기존 결제 통합 테스트에는 실제 결제사 대신 동작하는 `FakePaymentPort`가 구현되어 있다. 이를 사용해 결제사 응답을 `CAPTURED`로 설정하고, 승인 요청 횟수와 두 요청의 실행 순서를 확인할 수 있다.
+
+이번 테스트에서는 이 대역으로 **외부 결제 승인이 성공한 상황**을 만든 뒤, 내부 DB 처리에서 실패를 발생시켜 A·B 요청의 최종 결과를 확인하려 한다. 실제 결제사에는 요청을 보내지 않는다.
+## 개선 전 결과 확인 
+### 테스트 코드 구조 
+```java
+@Test
+@Transactional(propagation = Propagation.NOT_SUPPORTED)
+@DisplayName("외부 승인 후 내부 처리 실패 시 동시 승인 요청의 동작을 확인한다")
+void retriesCaptureAfterConcurrentInternalRollback() throws Exception {
+  // 결제 승인에 필요한 주문서·확인서·결제 시도를 준비한다.
+  Fixture fixture = prepareFixture("payment-capture-rollback");
+  sellerOrderFormSubmissionViewUseCase.markViewed(
+      fixture.inquiry().getId(),
+      fixture.submission().getId(),
+      fixture.store().id());
+
+  SendOrderConfirmationResult confirmation = sendConfirmation(fixture);
+  orderConfirmationStateService.markBuyerViewed(
+      fixture.inquiry().getId(),
+      confirmation.orderConfirmation().id(),
+      fixture.buyer().getId());
+
+  PaymentPreparationResult prepared = paymentPrepareUseCase.prepare(
+      PreparePaymentCommand.of(
+          fixture.inquiry().getId(),
+          confirmation.orderConfirmation().id(),
+          fixture.buyer().getId()));
+
+  // 외부 승인이 성공한 뒤, 내부 상태 이력 저장에서 A 요청만 실패시킨다.
+  AtomicBoolean failOnce = new AtomicBoolean(true);
+  doAnswer(invocation -> {
+    if (failOnce.compareAndSet(true, false)) {
+      throw new IllegalStateException("simulated failure after external capture");
+    }
+    return invocation.callRealMethod();
+  }).when(orderStatusHistoryPersistencePort).save(any());
+
+  paymentProviderFake.blockCapture();
+  ExecutorService executorService = Executors.newFixedThreadPool(2);
+  CountDownLatch secondCaptureStarted = new CountDownLatch(1);
+
+  try {
+    Future<PaymentCaptureResult> first = executorService.submit(() ->
+        paymentCaptureUseCase.capture(CapturePaymentCommand.of(
+            prepared.paymentAttemptId(),
+            fixture.buyer().getId(),
+            prepared.sessionId(),
+            "payer-new")));
+
+    // A가 결제사 승인 호출에 도달해 멈춘 뒤 B를 시작한다.
+    assertTrue(paymentProviderFake.awaitCaptureStarted());
+
+    Future<PaymentCaptureResult> second = executorService.submit(() -> {
+      secondCaptureStarted.countDown();
+      return paymentCaptureUseCase.capture(CapturePaymentCommand.of(
+          prepared.paymentAttemptId(),
+          fixture.buyer().getId(),
+          prepared.sessionId(),
+          "payer-new"));
+    });
+
+    assertTrue(secondCaptureStarted.await(5, TimeUnit.SECONDS));
+    assertFalse(second.isDone());
+
+    paymentProviderFake.releaseCapture();
+
+    // A의 내부 DB 처리는 실패한다.
+    ExecutionException firstFailure =
+        assertThrows(ExecutionException.class,
+            () -> first.get(10, TimeUnit.SECONDS));
+    assertEquals(
+        "simulated failure after external capture",
+        firstFailure.getCause().getMessage());
+
+    // B의 처리 결과와 최종 저장 상태를 확인한다.
+    PaymentCaptureResult secondResult = second.get(10, TimeUnit.SECONDS);
+    Order order = orderJpaRepository
+        .findByPaymentAttemptId(prepared.paymentAttemptId())
+        .orElseThrow();
+
+    assertEquals(2, paymentProviderFake.captureCount());
+    assertEquals(PaymentAttemptStatus.SUCCEEDED, secondResult.status());
+    assertEquals(
+        PaymentAttemptStatus.SUCCEEDED,
+        paymentAttemptJpaRepository
+            .findById(prepared.paymentAttemptId())
+            .orElseThrow()
+            .getStatus());
+    assertEquals(order.getId(), secondResult.orderId());
+    assertEquals(
+        1,
+        orderJpaRepository
+            .findAllByBuyerUserIdOrderByCreatedAtDesc(fixture.buyer().getId())
+            .size());
+    assertEquals(
+        1,
+        orderStatusHistoryPersistencePort.findAllByOrderId(order.getId()).size());
+    assertEquals(1, paymentCompletedNotificationCount(fixture.buyer().getId()));
+    assertEquals(1, paymentCompletedNotificationCount(fixture.seller().getId()));
+    assertEquals(
+        1,
+        paymentCompletedTimelineCount(fixture.inquiry().getId(), order.getId()));
+  } finally {
+    paymentProviderFake.releaseCapture();
+    executorService.shutdownNow();
+  }
+}
+```
+
+### 테스트 결과 
+
+<ResponsiveTable wide>
+
+| 해당 로그                                                                                                                              | 의미                                                       |
+| ---------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
+| `[Test worker] insert into payment_attempts`                                                                                       | 테스트 준비 단계에서 결제 시도를 생성                                    |
+| `[pool-7-thread-1] select ... from payment_attempts ... for no key update`                                                         | A가 결제 시도의 쓰기 잠금을 요청                                      |
+| `[pool-7-thread-2] select ... from payment_attempts ... for no key update`                                                         | B도 같은 결제 시도의 잠금을 요청                                      |
+| `[pool-7-thread-1] select ... from order_confirmations / inquiries / users / order_start_reference_assets / orders`                | A가 결제 완료에 필요한 내부 데이터를 조회                                 |
+| `[pool-7-thread-2] select ... from orders` 등                                                                                       | A의 주입된 예외 이후 B의 내부 처리가 진행됨. **예외 자체는 이 SQL 로그에 표시되지 않음** |
+| `[pool-7-thread-2] insert into orders / order_status_histories / notifications / chat_timeline_items`, `update payment_attempts` 등 | B가 주문과 완료 기록을 저장하고 관련 상태를 갱신                             |
+| `[Test worker] select ... from orders / payment_attempts / order_status_histories / notifications / chat_timeline_items`           | 테스트가 최종 DB 상태를 조회해 검증                                    |
+
+</ResponsiveTable>
+
+A의 외부 승인 결과가 `CAPTURED`로 반환된 뒤 내부 처리가 실패하자, A의 DB 변경은 남지 않았다. 이후 B가 같은 결제 시도에 대해 외부 승인 API를 다시 호출했다. 최종 DB에는 주문과 완료 기록이 각각 한 번만 저장됐다.
+
+기존에 정한 테스트 중점 확인 부분과 비교해보면 
+ 1. 트랜잭션이 롤백됐을 때 DB에 어떤 상태가 남는지  
+	 결제사의 Fake 응답은 `CAPTURED`였지만, DB의 결제 시도는 기존 `READY` 상태로 남았다. A가 진행한 주문·이력·알림도 DB에 남지 않았다.
+ 2. 대기하던 B가 잠금을 획득한 뒤 어떤 분기로 들어가는지 확인  
+	B는 `READY` 상태를 읽어 `NEEDS_CONFIRMATION` 분기가 아니라 **신규 승인 요청 분기**로 들어갔다. 그래서 `startCapture()` 후 결제사의 `capture()`를 호출하였다.
+ 3. 특히 결제사 승인 요청이 다시 발생하는지와 최종 주문·이력·알림이 몇 건 생성되는지 확인
+	Fake 결제사의 `capture()`는 **총 2회(A 1회, B 1회)** 호출되었다. B의 처리가 끝난 뒤 DB에는 **주문 1건, 상태 이력 1건, 구매자·판매자 완료 알림 각 1건, 완료 타임라인 1건**이 남았고 결제 시도는 `SUCCEEDED`로 남았다.
+## 개선 여부 판단 
+
+테스트에서 A의 내부 트랜잭션은 정상적으로 롤백됐지만, 결제사의 승인 결과까지는 롤백이 불가능하다.
+그 결과 내부 결제 시도는 `READY`로 남고, 대기하던 B는 결제사에 승인을 다시 요청했다.  
+**재호출이 실제 중복 결제로 이어지는지는 결제사의 동일 세션 재승인 정책에 달려 있다.** 같은 세션을 사용한다는 사실만으로 결과를 단정할 수는 없다.  
+결제사가 멱등성 처리를 지원하여 중복 청구를 막더라도, **A만 요청하고 내부 처리가 실패하면 외부에는 승인된 결제가 있고 내부에는 주문이 없는 상태**가 남을 수 있다. 
+따라서 개선 여부를 판단할 핵심은 이 상태를 재요청 없이도 확인하고 복구할 수 있는가이다.
+
+### 개선 방법 
+<ResponsiveTable wide>
+
+| 방법                        | 외부 성공·내부 실패 시 하는 일                                                                                                                        |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| **1. 내부 처리 재시도**          | 결제사에 **기존 세션의 상태를 조회**한다. 이미 승인됐다면 결제를 다시 승인하지 않고 주문 생성 등 실패한 내부 처리를 완료한다.                                                                |
+| **2. 외부 작업 보상**           | 내부 처리를 완료할 수 없다면 이미 승인된 결제를 취소하거나 환불해 양쪽을 실패 상태로 맞춘다. 환불은 DB 롤백과 달리 **새로운 외부 작업**이므로, 그 작업의 실패도 처리해야 한다.                                  |
+| **3. 복구 대상 기록과 백그라운드 점검** | 외부 호출 전에 결제 시도와 세션 ID를 DB에 남긴다. 이후 처리 중 끊겨도 작업자가 미완료 건의 결제사 상태를 조회하고 1번 또는 2번을 수행한다. **사용자 재요청이 없어도 복구하기 위한 방법**이다.                       |
+| **4. 결제사 멱등성 이용**         | 결제사가 지원하는 멱등성 키 등을 같은 결제 시도에 계속 사용해, 승인 요청을 재시도해도 외부 효과가 중복되지 않게 한다. 단, 이것만으로 **승인 후 누락된 내부 주문이 복구되지는 않는다.**                              |
+| **5. 결제사 이벤트 수신**         | 결제사의 승인 완료 이벤트를 받아 내부 상태를 확인하고 누락된 처리를 수행한다. 이벤트가 중복되거나 늦게 와도 안전하도록 내부 처리는 멱등해야 하며, 누락에 대비한 상태 조회를 함께 둘 수 있다.                             |
+| **6. 트랜잭셔널 아웃박스**         | **우리 DB 변경 후 외부 메시지를 보내는 방향**이라면, DB 변경과 발송할 메시지를 한 트랜잭션에 저장하고 별도 작업자가 발송한다. 다만 이번처럼 **결제사가 이미 승인한 뒤 우리 DB가 실패한 상황을 아웃박스만으로 해결하지는 못한다.**  |
+
+</ResponsiveTable>
+
+현재 프로젝트에서는 1번,3번을 함께 적용하는 것이 적합하다고 판단했다. 
+결제 시도와 외부 세션 ID가 승인 요청 전에 DB에 저장되고, 기존 구현에도 세션 상태 조회와 결제 완료 처리 로직이 있기 때문이다. 따라서 내부 처리에 실패했더라도 해당 세션이 실제로 승인됐는지 확인한 뒤, 승인된 건의 주문 생성을 다시 시도할 수 있다.
+
+다만 재시도를 구매자의 요청에만 맡기면, A 요청 이후 아무도 다시 호출하지 않았을 때 외부에는 승인된 결제가 있고 내부에는 주문이 없는 상태가 계속 남는다. 미완료 결제 시도를 주기적으로 점검하면 사용자 재요청 없이도 이 상태를 발견해 복구를 시도할 수 있다.
+## 개선 후 재검증 
+### 핵심 개선 필요사항 
+1. 결제 승인 기능의 트랙잭션 경계 : 외부 호출 전에 **"승인을 시도 중"** 이라는  상태를 별도 트랜잭션으로 확정하여 복구할 단서를 남긴다
+2. 결제사 상태 확인 후 완료하는 경로 : 기존에는 **"확인 필요"** 상태에서만 결제사에 세션 상태를 조회했지만 재부 처리 실패로 **"승인을 시도 중"** 인 결제 시도도 세션 상태를 조회하도록 변경 
+3. 미완료 건을 찾는 복구 작업 결제 재조회 : 오래 **"승인을 시도 중"** 등에 머문 결제 시도를 조회해 2번 경로를 실행하는 작업이 필요 - 재요청이 없어도 반영되도록 
+
+### 개선 사항 
+#### 외부 승인 호출과 DB트랜잭션 분리 
+```java
+// 기존 
+@Transactional // PaymentService 클래스 전체
+public class PaymentService {
+  public PaymentCaptureResult capture(CapturePaymentCommand command) {
+    PaymentAttempt paymentAttempt = getPaymentAttempt(command.paymentAttemptId());
+    paymentAttempt.startCapture();
+    Point3CaptureResult result = requestCapture(paymentAttempt.getPoint3SessionId());
+    return applyCaptureResult(paymentAttempt, command.payerId(), result);
+  }
+}
+
+// ======================================================================
+
+// 변경 
+public PaymentCaptureResult capture(CapturePaymentCommand command) {
+  validateCaptureMessage(command);
+
+  // 먼저 IN_PROGRESS를 DB에 커밋
+  CaptureStep step = transaction(() -> beginCapture(command));
+  if (step.action() == CaptureAction.RETURN) {
+    return step.result();
+  }
+
+  // DB 트랜잭션 밖에서 결제사 호출
+  Point3CaptureResult providerResult = step.action() == CaptureAction.CAPTURE
+      ? requestCapture(step.sessionId())
+      : requestSession(step.sessionId());
+
+  // 결제사 결과와 주문 생성은 별도 트랜잭션에서 처리
+  return transaction(
+      () -> applyProviderResult(command.paymentAttemptId(), command.payerId(), providerResult));
+}
+```
+
+> `transaction()`은 Spring의 트랜잭션 관리 인터페이스인 `PlatformTransactionManager`를 `TransactionTemplate`에 전달해 사용합니다. `TransactionTemplate.execute()`는 전달받은 작업을 트랜잭션 안에서 실행하고, 정상 종료되면 커밋하며 예외가 발생하면 롤백합니다. 여기서는 `REQUIRES_NEW`를 설정해 호출할 때마다 별도의 트랜잭션에서 작업하도록 구성하였습니다..
+
+첫 요청의 내부 처리에서 롤백이 발생해도 앞서 커밋한 `IN_PROGRESS`는 남는다 => 따라서 대기하던 두 번째 요청이 `READY`로 판단하여 승인을 다시 호출하지 않도록 구성
+
+#### 복구에 필요한 정보 저장 
+```java
+// 기존
+public void startCapture() {
+  this.status = PaymentAttemptStatus.IN_PROGRESS;
+}
+
+// 변경
+public void startCapture(String payerId, Instant startedAt) {
+  this.payerId = Objects.requireNonNull(payerId, "payerId");
+  this.captureStartedAt = Objects.requireNonNull(startedAt, "startedAt");
+  this.status = PaymentAttemptStatus.IN_PROGRESS;
+  this.failureCode = null;
+}
+```
+
+승인 시작 시각과 결제 주체 ID를 저장해,원래 요청이 실패한 뒤에도 복구 작업이 해당 결제를 처리할 수 있게 구성
+
+#### 오래 멈춘 결제 복구 
+```java
+@Scheduled(fixedDelay = 60_000)
+public void reconcileStalePayments() {
+  Instant cutoff = Instant.now(clock).minus(RECOVERY_DELAY);
+
+  for (UUID paymentAttemptId :
+      paymentAttemptPersistencePort.findRecoverableIdsBefore(cutoff, 100)) {
+    try {
+      recoverPayment(paymentAttemptId);
+    } catch (Exception e) {
+      log.error("Payment recovery failed. paymentAttemptId={}", paymentAttemptId, e);
+    }
+  }
+}
+```
+
+>`@Scheduled`   는 Spring의 스케줄러가 메서드를 반복 호출하는 방식으로 `fixedDelay = 60_000` = 이전 실행이 끝난 뒤 60초가 지나면 다시 실행하게 됩니다.
+
+#### DB컬럼 
+```SQL
+ALTER TABLE payment_attempts
+    ADD COLUMN capture_started_at TIMESTAMPTZ,
+    ADD COLUMN reconciliation_checked_at TIMESTAMPTZ;
+```
+`capture_started_at` : 승인 요청을 시작하며  `IN_PROGRESS` 로 바꾼 시각 
+`reconciliation_checked_at` : 복구 대상의 마지막 확인 시각 
+
+### 개선 결과 검증 
+
+<ResponsiveTable wide>
+
+| 해당 로그                                                                                                                          | 의미                                                                            |
+| ------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------------- |
+| `[Test worker] insert into payment_attempts`                                                                                   | 테스트 준비 단계에서 결제 시도를 생성                                                         |
+| `[pool-7-thread-1] select ... for no key update` → `update payment_attempts`                                                   | A가 결제 시도를 잠그고 `IN_PROGRESS`로 변경                                               |
+| `[pool-7-thread-2] select ... for no key update`                                                                               | B도 같은 결제 시도에 쓰기 잠금을 요청                                                        |
+| `[pool-7-thread-1] select ... payment_attempts / order_confirmations / inquiries / users / orders`                             | A가 결제사 응답을 받은 뒤 내부 완료 처리를 진행. 이후 주입한 예외로 이 처리의 DB 변경은 롤백됨                     |
+| `[pool-7-thread-2] select ... from orders`                                                                                     | B는 결제 시도가 `IN_PROGRESS`인 분기로 들어가 기존 주문 여부를 확인한 뒤 결과를 반환. **B의 주문 생성 SQL은 없음** |
+| `[Test worker] select ... payment_attempts / orders`                                                                           | 테스트가 A 실패 후 남은 결제 시도 상태와 주문 부재를 확인                                            |
+| `[Test worker] update capture_started_at` → `select ... payment_attempts`                                                      | 테스트가 복구 대상이 되도록 승인 시작 시각을 과거로 바꾼 뒤, 복구 작업이 대상을 조회                             |
+| `[Test worker] select ... for no key update` 및 내부 데이터 조회                                                                       | 복구 작업이 결제 시도를 다시 잠그고, 결제사 세션 결과에 따른 완료 처리를 시작                                 |
+| `[Test worker] insert into orders / order_status_histories / notifications / chat_timeline_items`, `update payment_attempts` 등 | **복구 작업이** 주문과 완료 기록을 생성하고 결제 시도·주문확인서·문의 상태를 갱신                              |
+| `[Test worker] select ... orders / payment_attempts / order_status_histories / notifications / chat_timeline_items`            | 테스트가 최종 저장 결과를 조회해 검증                                                         |
+
+</ResponsiveTable>
+
+A와 B가 같은 결제 시도에 동시에 승인 요청을 보냈다. A는 결제 시도를 `IN_PROGRESS`로 변경한 뒤 외부 승인을 진행했지만, 이후 내부 주문 처리에서 주입한 예외로 해당 처리만 롤백됐다. 
+B는 `IN_PROGRESS` 상태를 확인하고 현재 결과를 반환했으며, 결제사에 승인을 다시 요청하거나 주문을 생성하지 않았다.
+
+이후 복구 작업이 **기존 결제 세션의 상태를 조회**했다. 결제사의 `CAPTURED` 결과를 확인한 뒤 주문과 상태 이력·완료 알림·채팅 타임라인을 생성하고 결제 시도를 `SUCCEEDED`로 변경했다.
+
+테스트에서는 결제사 `capture()` 호출 **1회**, 세션 조회 **1회**, 최종 주문과 완료 기록이 각각 중복 없이 생성된 것을 확인했다. 
+SQL 로그에는 DB 조회·변경 흐름이 나타나지만 외부 결제사 호출과 롤백 결과가 직접 표시되지는 않으므로, 이 두 부분은 테스트의 호출 횟수 및 최종 상태 검증을 근거로 판단했다.
+
+## 직접 분석후 개선해보며 느낀점 
+지금까지 트랜잭션과 동시성 문제의 가능성을 깊게 분석해본 경험은 드물었다. 이번에는 하나의 결제 기능을 대상으로 원자성, 일관성, 멱등성, 동시성이 각각 어떻게 보장되는지 확인하고, 외부 결제는 성공했지만 내부 처리가 실패하는 상황까지 재현해볼 수 있어 의미 있었다.
+
+물론 DB 잠금과 트랜잭션의 세부 동작은 계속 학습해야 한다. 그래도 이번 경험을 통해 앞으로 기능을 설계할 때 **어떤 상태를 DB에 먼저 확정해야 하는지, 외부 호출과 트랜잭션의 경계를 어디에 둘지, 실패와 동시 요청이 겹치면 어떤 결과가 남는지**를 먼저 생각해볼 수 있게 됐다. 문제가 발생할 가능성을 막연히 추측하는 데서 그치지 않고, 시나리오를 정의해 재현하고 결과를 검증하는 과정도 배웠다.
