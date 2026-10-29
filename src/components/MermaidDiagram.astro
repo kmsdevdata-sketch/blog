@@ -1,0 +1,138 @@
+---
+type Props = {
+  chart: string;
+  label: string;
+  kind?: "sequence" | "flowchart";
+};
+
+const { chart, label, kind = "flowchart" } = Astro.props;
+---
+
+<figure
+  class="mermaid-diagram not-prose"
+  data-mermaid-chart={chart}
+  data-kind={kind}
+>
+  <div class="mermaid-output" role="img" aria-label={label}></div>
+  <pre class="mermaid-fallback"><code>{chart}</code></pre>
+</figure>
+
+<style>
+  .mermaid-diagram {
+    margin-block: 1.5rem;
+    overflow-x: auto;
+    border: 1px solid var(--border);
+    border-radius: 0.75rem;
+    background: var(--background);
+    padding: 1rem;
+  }
+
+  .mermaid-output {
+    width: max-content;
+    min-width: 100%;
+  }
+
+  .mermaid-output :global(svg) {
+    display: block;
+    height: auto;
+    max-width: none;
+    margin-inline: auto;
+  }
+
+  .mermaid-diagram[data-kind="sequence"] .mermaid-output :global(svg) {
+    min-width: 44rem;
+  }
+
+  .mermaid-fallback {
+    overflow-x: auto;
+    margin: 0;
+    white-space: pre;
+  }
+
+  .mermaid-diagram[data-rendered="true"] .mermaid-fallback {
+    display: none;
+  }
+</style>
+
+<script>
+  import mermaid from "mermaid";
+
+  let generation = 0;
+  let renderId = 0;
+
+  async function renderCharts() {
+    const currentGeneration = ++generation;
+    const dark = document.documentElement.dataset.theme === "dark";
+    const foreground = dark ? "#f7f7f8" : "#0d0d0d";
+    const background = dark ? "#0d0d0d" : "#ffffff";
+    const surface = dark ? "#24243b" : "#eef0ff";
+    const border = dark ? "#8b83ff" : "#4f46e5";
+
+    mermaid.initialize({
+      startOnLoad: false,
+      securityLevel: "strict",
+      theme: "base",
+      themeVariables: {
+        background,
+        primaryColor: surface,
+        primaryTextColor: foreground,
+        primaryBorderColor: border,
+        secondaryColor: surface,
+        secondaryTextColor: foreground,
+        tertiaryColor: background,
+        tertiaryTextColor: foreground,
+        lineColor: border,
+        textColor: foreground,
+        actorBkg: surface,
+        actorBorder: border,
+        actorTextColor: foreground,
+        actorLineColor: border,
+        signalColor: foreground,
+        signalTextColor: foreground,
+        labelBoxBkgColor: background,
+        labelBoxBorderColor: border,
+        labelTextColor: foreground,
+        noteBkgColor: surface,
+        noteBorderColor: border,
+        noteTextColor: foreground,
+      },
+    });
+
+    for (const figure of document.querySelectorAll<HTMLElement>(
+      ".mermaid-diagram[data-mermaid-chart]"
+    )) {
+      const output = figure.querySelector<HTMLElement>(".mermaid-output");
+      if (!output) continue;
+
+      try {
+        const source = (figure.dataset.mermaidChart ?? "")
+          .replaceAll(
+            "rect rgb(235, 242, 255)",
+            dark ? "rect rgb(31, 35, 59)" : "rect rgb(235, 242, 255)"
+          )
+          .replaceAll(
+            "rect rgb(238, 248, 240)",
+            dark ? "rect rgb(25, 46, 41)" : "rect rgb(238, 248, 240)"
+          );
+        const { svg, bindFunctions } = await mermaid.render(
+          `mermaid-chart-${++renderId}`,
+          source
+        );
+        if (currentGeneration !== generation || !figure.isConnected) return;
+        output.innerHTML = svg;
+        bindFunctions?.(output);
+        figure.dataset.rendered = "true";
+      } catch {
+        figure.dataset.rendered = "false";
+      }
+    }
+  }
+
+  const observer = new MutationObserver(() => void renderCharts());
+  observer.observe(document.documentElement, {
+    attributes: true,
+    attributeFilter: ["data-theme"],
+  });
+  document.addEventListener("astro:after-swap", () => void renderCharts());
+  void renderCharts();
+</script>

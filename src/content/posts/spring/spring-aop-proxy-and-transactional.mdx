@@ -1,0 +1,331 @@
+---
+author: Minseo Kim
+pubDatetime: 2026-10-29T17:50:00+09:00
+title: Spring AOP 동작 원리와 @Transactional의 내부 흐름
+lang: ko
+translationKey: spring-aop-proxy-and-transactional
+category: Spring
+featured: false
+draft: false
+tags:
+  - Spring AOP
+  - Spring Boot
+  - Proxy
+  - Transaction
+  - JPA
+description: Spring AOP의 프록시 동작을 로깅 예제로 살펴보고, @Transactional의 내부 흐름과 JpaTransactionManager의 트랜잭션 시작 과정을 정리합니다.
+---
+
+import ResponsiveTable from "@/components/ResponsiveTable.astro";
+import MermaidDiagram from "@/components/MermaidDiagram.astro";
+
+이번에는 그동안 알고는 있었지만 `@Transactional` 같이 AOP기반의 기술만 사용해보았을뿐 명시적으로 기능분리를 하여 AOP를 적용해보지는 않았는데 이번에 한번 사용해보려한다
+## AOP(Aspect Oriented Programming)란?
+AOP 관점 지향 프로그래밍으로 **스프링 3대 요소** 중 하나이다.
+> 핵심 비즈니스 로직과 공통 부가 기능을 분리하여 코드의 모듈화를 높이는 프로그래밍 패러다임
+
+메서드 동작 전 후 과정에 부가로직 처리를 하게되며 `Filter`,`Interceptor` 등과도 주로 비교된다.
+
+- `Filter` : DispatcherServelt 전후 - 웹 컨테이너에서 관리
+  - XSS방어,인코딩 변환처리,요청 인증,권한 체크 등 - 요청이 DispatcherServlet에 전달되기 전
+- `Interceptor` : Controller 전후  - 스프링 컨테이너에서 관리
+  - 로그인 체크,권한체크,프로그램 실행시간 작업,로그확인
+- `AOP` : 메서드 동작의 전 후 과정에 부가로직 처리
+  - 로깅,트랜잭션,에러처리
+
+보통은 로깅,보안,트랜잭션 관리,성능 모니터링,예외 처리,데이터 검증,캐싱 등등 여러곳에 사용할 여지가 있지만 대표적인 예시는 아무래도 로깅이 대표적이다.
+
+---
+## AOP의 원리 
+Spring AOP는 메서드 호출을 프록시 객체가 먼저 받도록 하는 방식으로 동작한다.
+
+1. Spring 이 대상 객체를 빈으로 등록할 때 AOP적용 대상이면 프록시를 만들어둔다.(메서드 호출시마다 프록시 생성x)
+2. 다른 객체가 해당 메서드를 호출하면 프록시가 호출을 받는다.
+3. 프록시는 설정된 부가 동작을 실행하고 호출을 실제 대상 객체로 이어준다.
+4. 대상 메서드의 반환값이나 예외는 다시 프록시를 거쳐 호출자에게 전달된다.
+
+## AOP 사용해보기
+#### 핵심개념
+
+<ResponsiveTable>
+
+| 개념         | 설명                                 |
+| ---------- | ---------------------------------- |
+| Aspect     | 공통 관심사를 모듈화한 단위                    |
+| Advice     | 실제로 실행할 부가 기능                      |
+| Join Point | 부가 기능을 적용할 수 있는 실행 지점              |
+| Pointcut   | Advice를 적용할 Join Point를 선택하는 조건    |
+| Target     | 부가 기능이 적용되는 실제 객체                  |
+| Proxy      | Target을 대신하여 호출을 받아 부가 기능을 적용하는 객체 |
+| Weaving    | Aspect를 대상 실행 흐름에 연결하는 과정          |
+
+</ResponsiveTable>
+
+#### 주요 어노테이션
+
+<ResponsiveTable>
+
+|어노테이션|역할|
+|---|---|
+|`@Aspect`|이 클래스를 Aspect로 선언|
+|`@Component`|Spring 빈으로 등록|
+|`@Pointcut`|여러 Advice에서 쓸 대상 표현식을 따로 정의|
+|`@Before`|대상 메서드 실행 전|
+|`@AfterReturning`|정상 반환 후|
+|`@AfterThrowing`|예외 발생 후|
+|`@After`|정상·예외 여부와 관계없이 실행 후|
+|`@Around`|실행 전후를 감싸며 시간 측정 등에 사용|
+
+</ResponsiveTable>
+
+### 적용해보기
+
+```java
+@Aspect  
+@Component  
+public class LoggingAspect {  
+    private static final Logger log = LoggerFactory.getLogger(LoggingAspect.class);  
+  
+    @Around("execution(* spring.lab.BankingService.*(..))")  
+    public Object logExecution(ProceedingJoinPoint joinPoint) throws Throwable {         // 여기서 joinPoint는 AOP가 가로챈 메서드 실행지점이다
+        String method = joinPoint.getSignature().getName();  
+        long start = System.currentTimeMillis();  
+	  
+        try {  
+            // 해당지점에서 가로챈 메서드 계속 진행 
+            Object result = joinPoint.proceed();  
+            log.info("{} 성공 {{}ms}", method, System.currentTimeMillis() - start);  
+            // 원래 메서드를 호출한쪽(Ex.Controller) 에 결과를 돌려줌
+            return result;  
+        } catch (Throwable e) {  
+            log.warn("{} 실패 ({}ms): {}", method,  
+                    System.currentTimeMillis() - start, e.getMessage());  
+            throw e;  
+        }  
+    }  
+}
+```
+
+#### 실행 결과 
+```text
+POST localhost:8080/api/users
+body : {"name" : "kim"}
+
+2026-10-29T15:57:51.429+09:00  INFO 13788 --- [lab] [nio-8080-exec-1] spring.lab.aop.logging.LoggingAspect     : createUser 성공 {24ms}
+```
+
+#### 실행원리에 맞춘  동작과정
+<MermaidDiagram
+  chart={String.raw`
+sequenceDiagram
+    autonumber
+    participant Spring as Spring 컨테이너
+    participant Caller as 호출자
+    participant Proxy as 프록시
+    participant Aspect as LoggingAspect
+    participant Target as 원본 객체
+
+    rect rgb(235, 242, 255)
+        Note over Spring,Target: 앱 시작 시 — 프록시 준비
+        Spring->>Target: 대상 빈 생성
+        Spring->>Proxy: AOP 프록시 생성
+        Spring-->>Caller: 대상 빈 대신 프록시 제공
+    end
+
+    rect rgb(238, 248, 240)
+        Note over Caller,Target: 메서드 호출 시
+        Caller->>Proxy: 메서드 호출
+        Proxy->>Aspect: logExecution(joinPoint)
+        Aspect->>Aspect: 메서드 이름 확인, 시작 시간 기록
+        Aspect->>Target: proceed()로 호출 진행
+
+        alt 정상 반환
+            Target-->>Aspect: result
+            Aspect->>Aspect: 성공 로그 기록
+            Aspect-->>Proxy: return result
+            Proxy-->>Caller: result 전달
+        else 예외 발생
+            Target--xAspect: 예외
+            Aspect->>Aspect: 실패 로그 기록
+            Aspect--xProxy: 예외 다시 던짐
+            Proxy--xCaller: 예외 전달
+        end
+    end
+`}
+  label="Spring AOP 프록시 생성과 메서드 호출 흐름"
+  kind="sequence"
+/>
+
+---
+
+다음으로는 AOP기반 기술로 자주 언급되는 `@Transactional` 에 대해 알아보자.
+
+> AOP기반 기술로는 `@Transactional` 외에도 `@Async`,`@Cacheable`,`@PreAuthorize` 등등 많이있다.
+## `@Transactional` 
+
+데이터베이스 트랜잭션을 선언적으로 관리하기 위해 사용하는 어노테이션
+
+#### 순수 JPA - 트랜잭션 직접 관리 
+```java
+public class TransferService {
+
+    private final EntityManagerFactory emf;
+
+    public TransferService(EntityManagerFactory emf) {
+        this.emf = emf;
+    }
+
+    public void transfer(Long from, Long to, int amount) {
+        EntityManager em = emf.createEntityManager();
+        EntityTransaction tx = em.getTransaction();
+
+        try {
+            // 트랜잭션 시작
+            tx.begin();
+
+            Account sender = em.find(Account.class, from);
+            Account receiver = em.find(Account.class, to);
+
+            sender.withdraw(amount);
+            receiver.deposit(amount);
+
+            // 변경 감지 및 커밋
+            tx.commit();
+
+        } catch (RuntimeException | Error e) {
+            if (tx.isActive()) {
+                tx.rollback();
+            }
+            throw e;
+        } finally {
+            em.close();
+        }
+    }
+}
+```
+
+`try-catch`문과 `begin()`,`commit()` 을 사용하며 코드가 지저분 + **중복 코드 작성** 이 보인다.
+
+#### @Transactional을 적용하면?
+```java
+@Service
+public class TransferService {
+
+    @PersistenceContext
+    private EntityManager em;
+
+    @Transactional
+    public void transfer(Long from, Long to, int amount) {
+
+        Account sender = em.find(Account.class, from);
+        Account receiver = em.find(Account.class, to);
+
+        sender.withdraw(amount);
+        receiver.deposit(amount);
+    }
+}
+```
+
+위와같이 `try-catch`문과 `begin()`,`commit()`코드가 사라져 아주 깔끔해진다.
+> 여기에 Spring Data JPA가 제공하는 `JpaRepository` 인터페이스를 활용하면, `EntityManager`를 직접 사용하지 않고도 데이터 접근 로직을 구현할 수 있다
+
+이러한 이유는 Spring AOP 프록시와 `TransactionInterceptor`가 `JpaTransactionManager`를 통해 트랜잭션을 관리하기 때문이다.
+
+### `@Transactional`의 내부 동작
+
+그렇다면 `@Transactional`은 내부적으로 어떻게 동작할까?
+실제 Spring 코드를 살펴보면 다음과 같은 흐름으로 실행되는 것을 확인할 수 있다.
+
+<MermaidDiagram
+  chart={String.raw`
+flowchart TD
+    A["Spring AOP Proxy"]
+    B["인터셉터 체인 조회 및 실행"]
+    C["TransactionInterceptor.invoke()"]
+    D["TransactionAspectSupport.invokeWithinTransaction()"]
+    E["JpaTransactionManager.doBegin()"]
+    F["비즈니스 메서드 실행"]
+    G["트랜잭션 Commit 또는 Rollback"]
+
+    A --> B --> C --> D --> E --> F --> G
+`}
+  label="@Transactional 내부 실행 흐름"
+  kind="flowchart"
+/>
+
+먼저 Spring AOP 프록시가 메서드 호출을 가로채고, 해당 메서드에 적용할 인터셉터 체인을 조회하여 실행한다.
+이때 `@Transactional`이 적용되어 있다면 `TransactionInterceptor`의 `invoke()`가 실행된다.
+
+```java
+@Override
+public Object invoke(MethodInvocation invocation)
+        throws Throwable {
+
+    // ... 생략
+
+    return invokeWithinTransaction(
+        invocation.getMethod(),
+        targetClass,
+        // ... 생략
+    );
+}
+```
+
+이후 부모 클래스인 `TransactionAspectSupport`의 `invokeWithinTransaction()`이 호출되며, 트랜잭션 관리 로직이 실행된다.
+
+이 과정에서 실제 트랜잭션 매니저가 `JpaTransactionManager`이고 새로운 트랜잭션을 시작해야 한다면 `doBegin()`이 호출된다.
+```Java
+@Override
+protected void doBegin(
+        Object transaction,
+        TransactionDefinition definition
+) {
+    JpaTransactionObject txObject =
+            (JpaTransactionObject) transaction;
+
+    try {
+        // 1. 트랜잭션에서 사용할 EntityManager 생성
+        if (!txObject.hasEntityManagerHolder() ||
+                txObject.getEntityManagerHolder().isSynchronizedWithTransaction()) {
+
+            EntityManager newEm = createEntityManagerForTransaction();
+
+            txObject.setEntityManagerHolder(
+                    new EntityManagerHolder(newEm), true
+            );
+        }
+
+        EntityManager em =
+                txObject.getEntityManagerHolder().getEntityManager();
+
+        // 2. 실제 JPA 트랜잭션 시작
+        int timeoutToUse = determineTimeout(definition);
+
+        Object transactionData = getJpaDialect().beginTransaction(
+                em,
+                new JpaTransactionDefinition(
+                        definition,
+                        timeoutToUse,
+                        txObject.isNewEntityManagerHolder()
+                )
+        );
+
+        txObject.setTransactionData(transactionData);
+
+        // ... 생략
+
+        // 3. EntityManager를 현재 스레드에 바인딩
+        if (txObject.isNewEntityManagerHolder()) {
+            TransactionSynchronizationManager.bindResource(
+                    obtainEntityManagerFactory(),
+                    txObject.getEntityManagerHolder()
+            );
+        }
+
+        // ... 생략
+    }
+    // 예외 처리 생략
+}
+```
+`doBegin()`은 JPA 트랜잭션을 시작하기 위한 작업을 수행하며, 이후 비즈니스 메서드 실행 결과에 따라 커밋 또는 롤백이 처리된다 => 개발자가 직접 작성했던 트랜잭션 시작 로직을 Spring이 대신 처리하는 것이다.
+

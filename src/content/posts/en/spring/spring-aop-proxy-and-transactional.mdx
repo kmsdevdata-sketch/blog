@@ -1,0 +1,330 @@
+---
+author: Minseo Kim
+pubDatetime: 2026-10-29T17:50:00+09:00
+title: How Spring AOP Works and the Internal Flow of @Transactional
+lang: en
+translationKey: spring-aop-proxy-and-transactional
+category: Spring
+featured: false
+draft: false
+tags:
+  - Spring AOP
+  - Spring Boot
+  - Proxy
+  - Transaction
+  - JPA
+description: I walk through Spring AOP's proxy behavior with a logging example, then look at the internal flow of @Transactional and how JpaTransactionManager starts a transaction.
+---
+
+import ResponsiveTable from "@/components/ResponsiveTable.astro";
+import MermaidDiagram from "@/components/MermaidDiagram.astro";
+
+This time, I'm going to try using AOP. I had known about it for a while and had used AOP-based features such as `@Transactional`, but I hadn't explicitly separated a feature out and applied AOP myself.
+## What Is AOP (Aspect Oriented Programming)?
+AOP stands for aspect-oriented programming and is one of **Spring's three major elements**.
+> A programming paradigm that increases code modularity by separating core business logic from common supplementary features
+
+It handles supplementary logic before and after a method runs, and is often compared with `Filter`, `Interceptor`, and the like.
+
+- `Filter`: Before and after DispatcherServelt — managed by the web container
+  - XSS defense, encoding conversion, request authentication, permission checks, etc. — before a request reaches DispatcherServlet
+- `Interceptor`: Before and after the Controller — managed by the Spring container
+  - Login checks, permission checks, program execution time work, log inspection
+- `AOP`: Handles supplementary logic before and after a method runs
+  - Logging, transactions, error handling
+
+There are many places where it could be used, such as logging, security, transaction management, performance monitoring, exception handling, data validation, and caching, but logging is probably the most representative example.
+
+---
+## How AOP Works
+Spring AOP works by having a proxy object receive a method call first.
+
+1. When Spring registers a target object as a bean, it creates a proxy if the target is subject to AOP. (It does not create a proxy on every method call.)
+2. When another object calls the method, the proxy receives the call.
+3. The proxy runs the configured supplementary behavior and passes the call on to the actual target object.
+4. The target method's return value or exception then goes back through the proxy to the caller.
+
+## Trying Out AOP
+#### Core Concepts
+
+<ResponsiveTable>
+
+| Concept    | Description                                                             |
+| ---------- | ----------------------------------------------------------------------- |
+| Aspect     | A unit that modularizes a cross-cutting concern                         |
+| Advice     | The supplementary feature that actually runs                            |
+| Join Point | An execution point where a supplementary feature can be applied         |
+| Pointcut   | A condition that selects the Join Points to which Advice is applied     |
+| Target     | The actual object to which a supplementary feature is applied           |
+| Proxy      | An object that receives calls on behalf of the Target and applies the supplementary feature |
+| Weaving    | The process of connecting an Aspect to the target execution flow        |
+
+</ResponsiveTable>
+
+#### Main Annotations
+
+<ResponsiveTable>
+
+| Annotation | Role |
+|---|---|
+|`@Aspect`|Declares this class as an Aspect|
+|`@Component`|Registers it as a Spring bean|
+|`@Pointcut`|Defines a target expression separately for use in multiple Advice methods|
+|`@Before`|Before the target method executes|
+|`@AfterReturning`|After a normal return|
+|`@AfterThrowing`|After an exception occurs|
+|`@After`|After execution, regardless of whether it returned normally or threw an exception|
+|`@Around`|Wraps execution before and after, and is used for things like measuring time|
+
+</ResponsiveTable>
+
+### Applying It
+
+```java
+@Aspect  
+@Component  
+public class LoggingAspect {  
+    private static final Logger log = LoggerFactory.getLogger(LoggingAspect.class);  
+  
+    @Around("execution(* spring.lab.BankingService.*(..))")  
+    public Object logExecution(ProceedingJoinPoint joinPoint) throws Throwable {         // Here, joinPoint is the method execution point intercepted by AOP
+        String method = joinPoint.getSignature().getName();  
+        long start = System.currentTimeMillis();  
+	  
+        try {  
+            // Continue the method intercepted at this point
+            Object result = joinPoint.proceed();  
+            log.info("{} 성공 {{}ms}", method, System.currentTimeMillis() - start);  
+            // Return the result to whoever called the original method (e.g., a Controller)
+            return result;  
+        } catch (Throwable e) {  
+            log.warn("{} 실패 ({}ms): {}", method,  
+                    System.currentTimeMillis() - start, e.getMessage());  
+            throw e;  
+        }  
+    }  
+}
+```
+
+#### Result
+```text
+POST localhost:8080/api/users
+body : {"name" : "kim"}
+
+2026-10-29T15:57:51.429+09:00  INFO 13788 --- [lab] [nio-8080-exec-1] spring.lab.aop.logging.LoggingAspect     : createUser 성공 {24ms}
+```
+
+#### How It Proceeds According to the Execution Principle
+<MermaidDiagram
+  chart={String.raw`
+sequenceDiagram
+    autonumber
+    participant Spring as Spring Container
+    participant Caller as Caller
+    participant Proxy as Proxy
+    participant Aspect as LoggingAspect
+    participant Target as Original Object
+
+    rect rgb(235, 242, 255)
+        Note over Spring,Target: When the app starts — prepare the proxy
+        Spring->>Target: Create the target bean
+        Spring->>Proxy: Create the AOP proxy
+        Spring-->>Caller: Provide the proxy instead of the target bean
+    end
+
+    rect rgb(238, 248, 240)
+        Note over Caller,Target: When the method is called
+        Caller->>Proxy: Call the method
+        Proxy->>Aspect: logExecution(joinPoint)
+        Aspect->>Aspect: Check the method name, record the start time
+        Aspect->>Target: Continue the call with proceed()
+
+        alt Normal return
+            Target-->>Aspect: result
+            Aspect->>Aspect: Record a success log
+            Aspect-->>Proxy: return result
+            Proxy-->>Caller: Pass on result
+        else Exception occurs
+            Target--xAspect: Exception
+            Aspect->>Aspect: Record a failure log
+            Aspect--xProxy: Throw the exception again
+            Proxy--xCaller: Pass on the exception
+        end
+    end
+`}
+  label="Spring AOP proxy creation and method call flow"
+  kind="sequence"
+/>
+
+---
+
+Next, let's look at `@Transactional`, which is often mentioned as an AOP-based feature.
+
+> Besides `@Transactional`, there are many other AOP-based features, such as `@Async`, `@Cacheable`, and `@PreAuthorize`.
+## `@Transactional`
+
+An annotation used to manage database transactions declaratively
+
+#### Plain JPA — Managing Transactions Directly
+```java
+public class TransferService {
+
+    private final EntityManagerFactory emf;
+
+    public TransferService(EntityManagerFactory emf) {
+        this.emf = emf;
+    }
+
+    public void transfer(Long from, Long to, int amount) {
+        EntityManager em = emf.createEntityManager();
+        EntityTransaction tx = em.getTransaction();
+
+        try {
+            // Start the transaction
+            tx.begin();
+
+            Account sender = em.find(Account.class, from);
+            Account receiver = em.find(Account.class, to);
+
+            sender.withdraw(amount);
+            receiver.deposit(amount);
+
+            // Detect changes and commit
+            tx.commit();
+
+        } catch (RuntimeException | Error e) {
+            if (tx.isActive()) {
+                tx.rollback();
+            }
+            throw e;
+        } finally {
+            em.close();
+        }
+    }
+}
+```
+
+It uses `try-catch`, `begin()`, and `commit()`, and you can see that the code is messy + has **duplicated code**.
+
+#### What If We Apply @Transactional?
+```java
+@Service
+public class TransferService {
+
+    @PersistenceContext
+    private EntityManager em;
+
+    @Transactional
+    public void transfer(Long from, Long to, int amount) {
+
+        Account sender = em.find(Account.class, from);
+        Account receiver = em.find(Account.class, to);
+
+        sender.withdraw(amount);
+        receiver.deposit(amount);
+    }
+}
+```
+
+As you can see above, the `try-catch`, `begin()`, and `commit()` code disappears, making it much cleaner.
+> If you also use the `JpaRepository` interface provided by Spring Data JPA, you can implement data access logic without using `EntityManager` directly.
+
+This is because the Spring AOP proxy and `TransactionInterceptor` manage transactions through `JpaTransactionManager`.
+
+### How `@Transactional` Works Internally
+
+So how does `@Transactional` work internally?
+If we look at the actual Spring code, we can confirm that it executes in the following flow.
+
+<MermaidDiagram
+  chart={String.raw`
+flowchart TD
+    A["Spring AOP Proxy"]
+    B["Find and execute the interceptor chain"]
+    C["TransactionInterceptor.invoke()"]
+    D["TransactionAspectSupport.invokeWithinTransaction()"]
+    E["JpaTransactionManager.doBegin()"]
+    F["Execute the business method"]
+    G["Commit or Rollback the transaction"]
+
+    A --> B --> C --> D --> E --> F --> G
+`}
+  label="Internal execution flow of @Transactional"
+  kind="flowchart"
+/>
+
+First, the Spring AOP proxy intercepts the method call, then looks up and executes the interceptor chain to apply to that method.
+At this point, if `@Transactional` is applied, `TransactionInterceptor`'s `invoke()` runs.
+
+```java
+@Override
+public Object invoke(MethodInvocation invocation)
+        throws Throwable {
+
+    // ... omitted
+
+    return invokeWithinTransaction(
+        invocation.getMethod(),
+        targetClass,
+        // ... omitted
+    );
+}
+```
+
+After that, `invokeWithinTransaction()` in the parent class, `TransactionAspectSupport`, is called, and the transaction management logic runs.
+
+In this process, if the actual transaction manager is `JpaTransactionManager` and a new transaction needs to begin, `doBegin()` is called.
+```Java
+@Override
+protected void doBegin(
+        Object transaction,
+        TransactionDefinition definition
+) {
+    JpaTransactionObject txObject =
+            (JpaTransactionObject) transaction;
+
+    try {
+        // 1. Create an EntityManager to use for the transaction
+        if (!txObject.hasEntityManagerHolder() ||
+                txObject.getEntityManagerHolder().isSynchronizedWithTransaction()) {
+
+            EntityManager newEm = createEntityManagerForTransaction();
+
+            txObject.setEntityManagerHolder(
+                    new EntityManagerHolder(newEm), true
+            );
+        }
+
+        EntityManager em =
+                txObject.getEntityManagerHolder().getEntityManager();
+
+        // 2. Start the actual JPA transaction
+        int timeoutToUse = determineTimeout(definition);
+
+        Object transactionData = getJpaDialect().beginTransaction(
+                em,
+                new JpaTransactionDefinition(
+                        definition,
+                        timeoutToUse,
+                        txObject.isNewEntityManagerHolder()
+                )
+        );
+
+        txObject.setTransactionData(transactionData);
+
+        // ... omitted
+
+        // 3. Bind the EntityManager to the current thread
+        if (txObject.isNewEntityManagerHolder()) {
+            TransactionSynchronizationManager.bindResource(
+                    obtainEntityManagerFactory(),
+                    txObject.getEntityManagerHolder()
+            );
+        }
+
+        // ... omitted
+    }
+    // Exception handling omitted
+}
+```
+`doBegin()` does the work needed to start a JPA transaction, and afterward the result of the business method determines whether it is committed or rolled back => Spring handles the transaction-starting logic that the developer had written directly.
