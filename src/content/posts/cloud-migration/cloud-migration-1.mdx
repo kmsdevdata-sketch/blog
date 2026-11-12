@@ -1,5 +1,5 @@
 ---
-title: "클라우드 마이그레이션 플랫폼 1편: 데이터 이전 과정"
+title: "클라우드 마이그레이션 1편: PostgreSQL 논리 복제로 무중단 데이터 이전하기"
 lang: ko
 translationKey: cloud-migration-1
 pubDatetime: 2026-11-12T16:00:00+09:00
@@ -8,13 +8,14 @@ featured: false
 draft: false
 tags:
   - Cloud Migration
+  - Data Migration
   - PostgreSQL
   - Logical Replication
   - CDC
   - WireGuard
   - PgBouncer
   - Kubernetes
-description: "소프트뱅크 해커톤에서 개발한 클라우드 마이그레이션 플랫폼의 데이터 이전 과정을 복제 경로 구축부터 네트워크 Preflight, PgBouncer 설치, 논리 복제 구독 생성까지 단계별로 정리합니다."
+description: "소프트뱅크 해커톤에서 만든 클라우드 마이그레이션 플랫폼으로 AWS EKS의 PostgreSQL을 온프레미스 k3s로 옮긴 과정을 정리합니다. WireGuard 터널로 복제 경로를 만들고 네트워크 Preflight로 검증한 뒤, 논리 복제(초기 복사 + CDC)로 앱을 멈추지 않고 데이터를 이전합니다."
 ---
 
 import GitHubRepoCard from "@/components/GitHubRepoCard.astro";
