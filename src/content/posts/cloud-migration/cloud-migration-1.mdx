@@ -19,7 +19,7 @@ description: "소프트뱅크 해커톤에서 개발한 클라우드 마이그�
 
 import GitHubRepoCard from "@/components/GitHubRepoCard.astro";
 import MermaidDiagram from "@/components/MermaidDiagram.astro";
-import dataMigrationDemo from "./assets/data-migration-demo.mp4";
+import dataMigrationDemo from "./assets/data-migration-demo.gif?url";
 
 이번에 소프트뱅크 해커톤에서 클라우드 마이그레이션 플랫폼을 개발하였다.  
 그 중 데이터 이전 과정에 대해 딥다이브 해보려한다.
@@ -37,17 +37,7 @@ import dataMigrationDemo from "./assets/data-migration-demo.mp4";
 >
 > **2편 · DB 전환 과정 (예정)**
 
-<video
-  src={dataMigrationDemo}
-  autoplay
-  muted
-  loop
-  playsinline
-  controls
-  preload="metadata"
-  aria-label="데이터 이전 진행 화면"
-  style="width: 100%; border-radius: 0.75rem;"
-></video>
+<img src={dataMigrationDemo} alt="데이터 이전 진행 화면" loading="lazy" />
 
 <MermaidDiagram
   label="데이터 이전부터 DB 전환까지의 전체 흐름"
