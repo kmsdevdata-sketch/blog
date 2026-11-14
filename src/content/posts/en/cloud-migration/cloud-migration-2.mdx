@@ -1,0 +1,173 @@
+---
+title: "Cloud Migration, Part 2: Preparing the DB Cutover with Sync Monitoring and a Shadow Rehearsal"
+lang: en
+translationKey: cloud-migration-2
+pubDatetime: 2026-11-13T16:00:00+09:00
+category: "Infra"
+featured: false
+draft: false
+tags:
+  - Cloud Migration
+  - Data Migration
+  - PostgreSQL
+  - Logical Replication
+  - Shadow Traffic
+  - Envoy
+  - PgBouncer
+  - Kubernetes
+description: "I walk through what happens after the data is moved with PostgreSQL logical replication and before the DB cutover is approved. The platform monitors the sync through replication state and lag, runs a shadow rehearsal by mirroring real GET traffic through Envoy, connects the app to PgBouncer, and then requests cutover approval."
+---
+
+import GitHubRepoCard from "@/components/GitHubRepoCard.astro";
+
+This is Part 2 of the technical deep dive into the data migration of the cloud migration platform I built at the SoftBank Hackathon finals.
+
+<GitHubRepoCard
+  repo="SoftBank-Hackathon-2026-Team-Jackal/cloud-migration-platform"
+  title="Cloud Migration Platform"
+  description="A cloud migration platform developed at the SoftBank Hackathon finals"
+  previewImage="https://opengraph.githubassets.com/83b609258d2f81f8121b37bef3e2b91ad3f4f0a049cf878a7a73eba5de4afdff/SoftBank-Hackathon-2026-Team-Jackal/cloud-migration-platform"
+/>
+
+> [!info] Cloud Migration Platform Series
+>
+> **[Part 1 · Zero-Downtime Data Migration with PostgreSQL Logical Replication](/en/posts/cloud-migration/cloud-migration-1/)**
+>
+> **Part 2 · Preparing the DB Cutover with Sync Monitoring and a Shadow Rehearsal**
+>
+> **Part 3 · The DB Cutover Process (coming soon)**
+
+Data migration runs along the flow below.
+
+```text
+Build the replication path
+-> Network preflight
+-> DB precheck
+-> Install PgBouncer
+-> Prepare
+-> Copy the schema
+-> Create the subscription
+-> Monitor the sync
+-> Shadow rehearsal (optional)
+-> Wait for the PgBouncer install to finish
+-> Monitor and request cutover approval
+```
+
+The previous part covered up to `Create the subscription`, and this time I'll look at it starting from sync monitoring.
+
+---
+
+## Sync Monitoring
+
+Sync monitoring ? The subscription creation step finishes almost as soon as the command runs, and the actual data copy runs separately inside PostgreSQL.  
+So the platform can't know "the subscription was created, but when has all the data come over", and to check that it has to keep checking the state => this is sync monitoring.
+
++ An additional reason for sync monitoring is that all the later steps proceed under the assumption that **"the target has fully caught up with the source"**.
+
+- Shadow rehearsal: if you compare responses while the data hasn't fully come over, they will of course mismatch
+- DB cutover : if there are many changes left, the time spent waiting with writes stopped gets longer => the downtime gets longer.
+
+### What Does Sync Monitoring Check
+
+#### Target DB : State per Table
+
+| Status | Meaning |
+|---|---|
+| `i` | Initializing |
+| `d` | Data copy in progress |
+| `f` | Data copy completed |
+| `s` | Synchronized, handing off to the apply worker |
+| `r` | Ready, receiving real-time changes only |
+
+#### Source DB : lag
+
+It calculates, in bytes, the difference between the WAL position the source has written so far (LSN - see the latter part of Part 1) and the position the slot has confirmed as "received up to here".
+
+Then it determines the phase based on the two values above `copy → catchup → streaming`
+
+- If even one is i/d/f, copy
+- If the copy is done but an s remains, the lag is over 1MiB, or the lag is unknown, catchup
+- If all are r and lag ≤ 1MiB, streaming
+
+---
+
+## Shadow Rehearsal
+
+The purpose of the shadow rehearsal is to send real traffic before the DB cutover to see whether the app responds the same way on the target too.
+
+```sql
+-- Original DB
+SELECT name FROM users WHERE id = 1;
+-- Result: kim
+
+-- Target DB
+SELECT name FROM users WHERE id = 1;
+-- Result: lee
+```
+
+Previously, row counts were compared based on checksums, but I decided that couldn't guarantee the integrity of the data inside, so I added this.
+
+### How It Copies
+
+It attaches a mirroring policy to the relay Envoy route with the condition "GET and an allowed path".  
+User requests go to the source as before, and only the copies go to the comparison collector.  
+Writes are never copied => concern that replicated data gets tangled if writes go into the target DB
+
+---
+
+## Waiting for the PgBouncer Install -> Changing the App Connection
+
+Since the PgBouncer install was already started in an earlier step, it only waits for the install to finish.  
+Once the PgBouncer install is complete, because the app is still connected to the source DB, this step changes the address the app looks at to PgBouncer.
+
+```text
+Before:  App ──────────────→ Source DB
+After:   App ──→ PgBouncer ──→ Source DB
+```
+
+1. Check whether the PgBouncer install is complete
+2. Build the app's new DB address : change only the destination of the DB address the app was using to PgBouncer
+3. Let the app go out to PgBouncer : if there's no path to PgBouncer because of firewall rules, open only that passage
+4. Check that the PgBouncer address is actually reachable : since there's a concern DNS may open late, it moves on only after a successful connection is confirmed
+5. Change the app config and restart : wait until no app using the old address remains
+
+---
+
+## Monitoring and Requesting Cutover Approval
+
+Once the app is connected to PgBouncer too, it now keeps monitoring and waiting until cutover approval is given.  
+Every 5 seconds, it checks the two things below.
+
+1. Replication state : whether it's still `streaming`, and how much lag there is
+2. Whether it's okay to stop writes right now
+   - Whether a long-running transaction is in progress => if writes are stopped, it has to wait until this transaction finishes
+   - Whether there are queries waiting on locks
+   - Whether replication is off or behind
+
+If the source is handling writes and replication is `streaming`, it sends a **cutover plan** to the web's second approval screen  
+The cutover plan contains the current replication state and the check results above, so the user can look at it and decide whether to approve.
+
+- It doesn't send it every cycle; it sends it again only when the state changes.
+- Whenever a new attempt happens, like the first attempt, a retry after rejection, or a retry after rollback, it also sends an approval request.
+
+If a shadow rehearsal was run, its result also goes into the cutover plan as a single line.
+
+| Item | State | Value | Evidence |
+|---|---|---|---|
+| shadow | pass | 1238/1240 | match ratio 0.99 or higher · target 5xx 0 |
+
+> The shadow result is **display only**. Even if it comes out as warn, it doesn't block approval, and the final decision is made by a person.
+
+When the approve button is pressed on the web, a cutover signal is delivered to the Workflow => from here, the actual DB cutover begins.
+
+---
+
+## Wrapping Up
+
+In this data migration process, I implemented the precheck and shadow traffic parts, but the replication and cutover flow that actually moves the data was the part my teammate handled, so following the code piece by piece this time taught me a lot.
+
+What especially stood out was the cutover approach using PgBouncer.  
+If the app is connected directly to the DB, you have to restart the app every time you switch the DB, but by putting PgBouncer between the app and the DB in advance, restarting only once at the start, and then doing the actual cutover by stopping writes very briefly and changing only the destination, the downtime was reduced.
+
+I also liked the part that first checks "whether it's okay to stop now" before stopping writes.  
+If you stop writes while there are long-running transactions or queries waiting on locks, the wait time gets that much longer, so I learned that you have to consider not just whether replication has caught up but what state the DB is actually in.
