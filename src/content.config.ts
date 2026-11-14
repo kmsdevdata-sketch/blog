@@ -19,7 +19,7 @@ const posts = defineCollection({
       lang: z.enum(["ko", "en"]).default("ko"),
       translationKey: z.string().optional(),
 
-      category: z.enum(["Java", "Spring", "CS", "DB", "Infra"]),
+      category: z.enum(["Java", "Spring", "CS", "DB", "Infra", "OSS"]),
 
       featured: z.boolean().optional(),
       draft: z.boolean().optional(),
