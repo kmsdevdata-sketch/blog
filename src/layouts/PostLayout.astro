@@ -4,6 +4,7 @@ import config from "@/config";
 
 type Props = {
   title?: string;
+  headline?: string;
   description?: string;
   ogImage?: string;
   canonicalURL?: string;
@@ -16,6 +17,7 @@ const { site } = config;
 
 const {
   title,
+  headline,
   description,
   ogImage,
   canonicalURL,
@@ -24,13 +26,21 @@ const {
   modDatetime,
 } = Astro.props;
 
+const pageURL = canonicalURL ?? new URL(Astro.url.pathname, Astro.site).href;
+
 const structuredData = {
   "@context": "https://schema.org",
   "@type": "BlogPosting",
-  headline: title ?? site.title,
+  headline: headline ?? title ?? site.title,
+  ...(description && { description }),
   image: ogImage,
+  url: pageURL,
+  mainEntityOfPage: { "@type": "WebPage", "@id": pageURL },
+  inLanguage: Astro.currentLocale ?? site.lang,
   ...(pubDatetime && { datePublished: pubDatetime.toISOString() }),
-  ...(modDatetime && { dateModified: modDatetime.toISOString() }),
+  ...((modDatetime ?? pubDatetime) && {
+    dateModified: (modDatetime ?? pubDatetime)!.toISOString(),
+  }),
   author: [
     {
       "@type": "Person",
@@ -41,11 +51,16 @@ const structuredData = {
 };
 ---
 
-<Layout {title} {description} {ogImage} {canonicalURL} {alternateUrls}>
+<Layout
+  {title}
+  {description}
+  {ogImage}
+  {canonicalURL}
+  {alternateUrls}
+  ogType="article"
+>
   <Fragment slot="head">
     <link rel="preconnect" href="https://giscus.app" crossorigin />
-    <!-- Override og:type for article pages -->
-    <meta property="og:type" content="article" />
 
     {
       pubDatetime && (

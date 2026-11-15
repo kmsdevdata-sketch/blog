@@ -18,6 +18,28 @@ import {
 } from "@shikijs/transformers";
 import { transformerFileName } from "./src/utils/transformers/fileName";
 import config from "./astro-paper.config";
+import { readdirSync, readFileSync } from "node:fs";
+import { join, parse } from "node:path";
+
+// Last-modified date per post (modDatetime, else pubDatetime), keyed by
+// "<lang>:<file name>", so the sitemap can tell crawlers when a post changed.
+function readPostDates(dir = "src/content/posts"): Map<string, string> {
+  const dates = new Map<string, string>();
+  for (const entry of readdirSync(dir, { withFileTypes: true, recursive: true })) {
+    if (!entry.isFile() || !/\.mdx?$/.test(entry.name)) continue;
+    const text = readFileSync(join(entry.parentPath, entry.name), "utf8");
+    const front = text.match(/^---\n([\s\S]*?)\n---/)?.[1] ?? "";
+    const field = (key: string) =>
+      front.match(new RegExp(`^${key}:\\s*["']?([^"'\\n]+)`, "m"))?.[1]?.trim();
+    const date = field("modDatetime") || field("pubDatetime");
+    if (!date || Number.isNaN(Date.parse(date))) continue;
+    const lang = field("lang") ?? "ko";
+    dates.set(`${lang}:${parse(entry.name).name.toLowerCase()}`, new Date(date).toISOString());
+  }
+  return dates;
+}
+
+const postDates = readPostDates();
 
 export default defineConfig({
   site: config.site.url,
@@ -29,6 +51,12 @@ export default defineConfig({
         !page.endsWith("/404/") &&
         (config.features?.showArchives !== false ||
           !page.endsWith("/archives/")),
+      serialize(item) {
+        const { pathname } = new URL(item.url);
+        const match = pathname.match(/^\/(en\/)?posts\/(?:.+\/)?([^/]+)\/$/);
+        const lastmod = match && postDates.get(`${match[1] ? "en" : "ko"}:${match[2]}`);
+        return lastmod ? { ...item, lastmod } : item;
+      },
     }),
   ],
   i18n: {

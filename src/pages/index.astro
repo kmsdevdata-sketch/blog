@@ -22,9 +22,22 @@ const sortedPosts = await getLocalizedPosts(locale as BlogLocale);
 const featuredPosts = sortedPosts.filter(({ data }) => data.featured);
 const recentPosts = sortedPosts.filter(({ data }) => !data.featured);
 const homePath = getRelativeLocaleUrl(locale, "");
+
+const homeMeta =
+  locale === "en"
+    ? {
+        title: `${config.site.title} | Backend Engineering Notes`,
+        description:
+          "Minseo Kim's backend engineering blog on Spring and Java, database query optimization and transactions, Kubernetes and cloud infrastructure, and open source contributions.",
+      }
+    : {
+        title: `${config.site.title} | 백엔드 개발 기록`,
+        description:
+          "Spring·Java 백엔드 개발, DB 쿼리 최적화와 트랜잭션, Kubernetes·클라우드 인프라, 오픈소스 기여 경험을 직접 부딪히며 기록하는 백엔드 개발 블로그입니다.",
+      };
 ---
 
-<Layout>
+<Layout title={homeMeta.title} description={homeMeta.description}>
   <Header />
   <main
     id="main-content"

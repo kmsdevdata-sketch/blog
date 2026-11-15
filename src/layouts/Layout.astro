@@ -15,6 +15,7 @@ type Props = {
   canonicalURL?: string;
   alternateUrls?: { ko: string; en: string };
   noindex?: boolean;
+  ogType?: "website" | "article";
 };
 
 const { site } = config;
@@ -26,12 +27,13 @@ const {
   canonicalURL = new URL(Astro.url.pathname, Astro.site).href,
   alternateUrls,
   noindex = false,
+  ogType = "website",
 } = Astro.props;
 
 const locale = Astro.currentLocale ?? site.lang;
 const logicalPath = stripLocale(stripBase(Astro.url.pathname), locale);
 const hasStaticTranslation =
-  /^\/(?:about|archives|categories(?:\/(?:java|spring|cs|db|infra))?|posts|search|tags)?\/?$/.test(
+  /^\/(?:about|archives|categories(?:\/(?:java|spring|cs|db|infra|oss))?|posts|search|tags)?\/?$/.test(
     logicalPath
   );
 const alternates =
@@ -43,6 +45,8 @@ const alternates =
       }
     : undefined);
 
+const ogLocales: Record<string, string> = { ko: "ko_KR", en: "en_US" };
+const ogLocale = ogLocales[locale] ?? "ko_KR";
 const socialImageURL = new URL(ogImage, Astro.site ?? Astro.url);
 const rssHref = getRelativeLocaleUrl(locale, "rss.xml").replace(/\/+$/, "");
 ---
@@ -68,6 +72,7 @@ const rssHref = getRelativeLocaleUrl(locale, "rss.xml").replace(/\/+$/, "");
     {noindex && <meta name="robots" content="noindex,follow" />}
     {alternates && <link rel="alternate" hreflang="ko" href={alternates.ko} />}
     {alternates && <link rel="alternate" hreflang="en" href={alternates.en} />}
+    {alternates && <link rel="alternate" hreflang="x-default" href={alternates.ko} />}
     <meta name="generator" content={Astro.generator} />
 
     <!-- Font -->
@@ -84,7 +89,14 @@ const rssHref = getRelativeLocaleUrl(locale, "rss.xml").replace(/\/+$/, "");
     <link rel="sitemap" href={getAssetPath("sitemap-index.xml")} />
 
     <!-- Open Graph -->
-    <meta property="og:type" content="website" />
+    <meta property="og:type" content={ogType} />
+    <meta property="og:locale" content={ogLocale} />
+    {
+      alternates &&
+        Object.values(ogLocales)
+          .filter(value => value !== ogLocale)
+          .map(value => <meta property="og:locale:alternate" content={value} />)
+    }
     <meta property="og:site_name" content={site.title} />
     <meta property="og:title" content={title} />
     <meta property="og:description" content={description} />
