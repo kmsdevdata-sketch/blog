@@ -40,6 +40,14 @@
       @apply marker:text-accent;
     }
 
+    ul.contains-task-list {
+      @apply list-none ps-0;
+    }
+
+    li.task-list-item input[type="checkbox"] {
+      @apply my-0 me-2;
+    }
+
     hr {
       @apply border-border;
     }
