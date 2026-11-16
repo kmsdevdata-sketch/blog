@@ -346,14 +346,6 @@ public class TestMethodTestDescriptor extends MethodBasedTestDescriptor {
 - [ ] `ClassBasedTestDescriptor`의 `isEmpty()` 체크 지점마다 헬퍼 호출 (`@BeforeAll` 이후 등)
 - [ ] 그 외 `throwableCollector.isEmpty()` 사용처 검색 후 누락 확인
 
-#### 4. 검증 테스트
-
-- [ ] 0번 재현 테스트 통과 (결과가 aborted로 보고됨)
-- [ ] 취소돼도 `@AfterEach` / `@AfterAll`은 실행되는지 확인
-- [ ] `@BeforeAll` 중 취소 케이스
-- [ ] `@ParameterizedTest`, `@Nested` 케이스
-- [ ] 기존 테스트 전체 통과 (`./gradlew build`)
-
 ---
 
 > 이제 다음 포스트에서 실제 작업과 후기를 남기겠습니다!

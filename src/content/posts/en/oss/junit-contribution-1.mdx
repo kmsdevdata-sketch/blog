@@ -346,14 +346,6 @@ As you can tell, all of this happens only in the platform layer, so it has to go
 - [ ] Call the helper at each `isEmpty()` checkpoint in `ClassBasedTestDescriptor` (after `@BeforeAll`, etc.)
 - [ ] Search the other places that use `throwableCollector.isEmpty()` and check nothing is missed
 
-#### 4. Verification Tests
-
-- [ ] Reproduction test 0 passes (the result is reported as aborted)
-- [ ] Check that `@AfterEach` / `@AfterAll` still run even when cancelled
-- [ ] Cancellation during `@BeforeAll` case
-- [ ] `@ParameterizedTest`, `@Nested` cases
-- [ ] All existing tests pass (`./gradlew build`)
-
 ---
 
 > In the next post, I'll cover the actual work and my retrospective!
